@@ -50,6 +50,11 @@ public final class HfmCli {
     private static String asString(Object v) {
         return (v == null || v instanceof Boolean) ? null : v.toString();
     }
+    private static boolean isTrue(Object v) {
+        if (v == null) return false;
+        String s = String.valueOf(v).trim();
+        return s.equalsIgnoreCase("true") || s.equalsIgnoreCase("yes") || s.equals("1");
+    }
 
     // ---------- login ----------
     private static Object tryLogin(String user, String pass, String cluster, String provider, String domain, String server) {
@@ -155,7 +160,8 @@ public final class HfmCli {
         String domain   = asString(a.get("domain"));
         String server   = asString(a.get("server"));
 
-        boolean dryRun = Boolean.parseBoolean(String.valueOf(a.getOrDefault("dryRun","false")));
+        boolean dryRun  = Boolean.parseBoolean(String.valueOf(a.getOrDefault("dryRun","false")));
+        boolean noLogin = isTrue(a.get("noLogin")); // NEW: let the action do its own login
 
         try {
             if (!"Consolidate".equalsIgnoreCase(op)) {
@@ -182,24 +188,26 @@ public final class HfmCli {
             if (user     != null) { params.put("User", user); params.put("Username", user); }
             if (pass     != null) { params.put("Password", pass); }
 
-            Object sessionInfo = tryLogin(user, pass, cluster, provider, domain, server);
-            if (sessionInfo != null) {
-                // object (some builds use this)
-                params.put("sessionInfo", sessionInfo);
-                params.put("SessionInfo", sessionInfo);
-
-                // ALSO provide raw SessionID string (other builds require this)
-                try {
-                    Method getSid = sessionInfo.getClass().getMethod("getSessionId");
-                    Object sid = getSid.invoke(sessionInfo);
-                    if (sid != null) {
-                        String s = sid.toString();
-                        params.put("SessionID", s);
-                        params.put("SessionId", s);
-                        params.put("sessionId", s);
-                    }
-                } catch (Throwable ignore) {}
-            }
+            // Either pass a SessionInfo (our login), OR let the Action log in itself (UC4-style)
+            if (!noLogin) {
+                Object sessionInfo = tryLogin(user, pass, cluster, provider, domain, server);
+                if (sessionInfo != null) {
+                    // Object form
+                    params.put("sessionInfo", sessionInfo);
+                    params.put("SessionInfo", sessionInfo);
+                    // String SessionID too (some builds require it)
+                    try {
+                        Method getSid = sessionInfo.getClass().getMethod("getSessionId");
+                        Object sid = getSid.invoke(sessionInfo);
+                        if (sid != null) {
+                            String s = sid.toString();
+                            params.put("SessionID", s);
+                            params.put("SessionId", s);
+                            params.put("sessionId", s);
+                        }
+                    } catch (Throwable ignore) {}
+                }
+            } // if noLogin==true we pass only User/Password/Cluster/Provider/Domain/Server
 
             if (dryRun) {
                 System.out.println("{\"status\":\"OK\",\"message\":\"DRY RUN\",\"application\":\""+app+"\"}");
