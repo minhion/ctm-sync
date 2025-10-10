@@ -80,3 +80,84 @@ public class HfmCli {
             if (!ok) fail(7, "Consolidate returned false");
 
             // 5) CLOSE + LOGOUT (best effort)
+            execActionIfPresent("oracle.epm.fm.actions.CloseApplicationAction", openMap);
+            Map<String,Object> logoutMap = new HashMap<>(base);
+            logoutMap.put("SessionInfo", session);
+            execActionIfPresent("oracle.epm.fm.actions.LogoutAction", logoutMap);
+
+            ok(t0, app, "Consolidation invoked");
+        } catch (InvocationTargetException ite) {
+            Throwable root = ite.getTargetException();
+            fail(6, "HFM error: " + root.getClass().getName() + ": " + safe(root.getMessage()));
+        } catch (Throwable t) {
+            fail(6, t.getClass().getName() + ": " + safe(t.getMessage()));
+        }
+    }
+
+    /* =================== Action glue =================== */
+
+    private static Object tryAuth(Map<String,Object> base, String[] classNames) throws Exception {
+        for (String cn : classNames) {
+            try {
+                Class<?> c = Class.forName(cn);
+                Object action = c.getDeclaredConstructor().newInstance();
+                Method exec = c.getMethod("execute", Map.class);
+                Object si = exec.invoke(action, base);
+                if (si != null) return si;
+
+                // some builds put SessionInfo into the map or expose getter
+                if (base.containsKey("SessionInfo")) return base.get("SessionInfo");
+                try {
+                    Method g = c.getMethod("getSessionInfo");
+                    Object s2 = g.invoke(action);
+                    if (s2 != null) return s2;
+                } catch (NoSuchMethodException ignored) {}
+            } catch (ClassNotFoundException ignored) {}
+        }
+        return null;
+    }
+
+    private static void execActionIfPresent(String className, Map<String,Object> params) throws Exception {
+        try {
+            Class<?> c = Class.forName(className);
+            Object action = c.getDeclaredConstructor().newInstance();
+            Method exec = c.getMethod("execute", Map.class);
+            exec.invoke(action, params);
+        } catch (ClassNotFoundException ignored) {}
+    }
+
+    private static boolean execConsolidate(Map<String,Object> params) throws Exception {
+        Class<?> c = Class.forName("oracle.epm.fm.actions.ConsolidateAction");
+        Object action = c.getDeclaredConstructor().newInstance();
+        Method exec = c.getMethod("execute", Map.class);
+        Object r = exec.invoke(action, params);
+        return (r instanceof Boolean) ? (Boolean) r : true;
+    }
+
+    /* =================== utils =================== */
+
+    private static Map<String,String> parse(String[] args){
+        Map<String,String> m = new LinkedHashMap<>();
+        if (args.length>0) m.put("_sub", args[0]);
+        for (int i=1;i<args.length;i++){
+            if (args[i].startsWith("--") && i+1<args.length) m.put(args[i], args[++i]);
+        }
+        return m;
+    }
+    private static String req(Map<String,String> m, String k){
+        String v = m.get(k);
+        if (v==null || v.isEmpty()) fail(2, "Missing arg: "+k);
+        return v;
+    }
+    private static void ok(long t0, String app, String msg){
+        long ms = System.currentTimeMillis()-t0;
+        System.out.println("{\"status\":\"OK\",\"application\":\""+esc(app)+"\",\"elapsed_ms\":"+ms+",\"message\":\""+esc(msg)+"\"}");
+        System.exit(0);
+    }
+    private static void fail(int code, String msg){
+        System.out.println("{\"status\":\"Error\",\"message\":\""+esc(msg)+"\"}");
+        System.exit(code);
+    }
+    private static String esc(String s){ return s==null?"":s.replace("\"","\\\""); }
+    private static String safe(String s){ return s==null?"":s.replace("\"","\\\"").replace("\n"," ").replace("\r"," "); }
+}
