@@ -1,12 +1,10 @@
 package com.bmc.ctm.hfmcli;
 
 import java.lang.reflect.Method;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 public final class HfmLoginProbe {
 
-    // --- small reflect helpers ---
+    // --- reflect helpers ---
     private static Class<?> clz(String name) {
         try { return Class.forName(name); } catch (Throwable t) { return null; }
     }
@@ -30,15 +28,13 @@ public final class HfmLoginProbe {
         } catch (Throwable t) { return null; }
     }
 
-    private static void println(String s){ System.out.println(s); }
     private static void diag(String s){ System.out.println("[diag] " + s); }
-
     private static String getPropOrNull(String key) {
         String v = System.getProperty(key);
         return (v == null || v.trim().isEmpty()) ? null : v;
     }
 
-    // try to get SessionInfo via multiple factories + methods
+    // Try to obtain SessionInfo via multiple factories/methods
     private static Object tryLogin(String user, String pass, String cluster, String provider, String domain, String server) {
         String[] factoryNames = {
             "oracle.epm.fm.common.service.ServiceClientFactory",
@@ -108,9 +104,9 @@ public final class HfmLoginProbe {
         String domain   = getPropOrNull("HFM_DOMAIN");
         String server   = getPropOrNull("HFM_SERVER");
 
-        println("=== HfmLoginProbe ===");
-        println("user=" + user);
-        println("cluster=" + cluster + " domain=" + domain + " server=" + server + " provider=" + provider);
+        System.out.println("=== HfmLoginProbe ===");
+        System.out.println("user=" + user);
+        System.out.println("cluster=" + cluster + " domain=" + domain + " server=" + server + " provider=" + provider);
 
         Object session = tryLogin(user, pass, cluster, provider, domain, server);
         if (session == null) {
@@ -121,21 +117,21 @@ public final class HfmLoginProbe {
         try {
             Method getSid = session.getClass().getMethod("getSessionId");
             Object sid = getSid.invoke(session);
-            println("SessionInfo OK");
-            println("  SessionId=" + sid);
+            System.out.println("SessionInfo OK");
+            System.out.println("  SessionId=" + sid);
 
             try {
                 Method getSrv = session.getClass().getMethod("getServerName");
                 Method getPort = session.getClass().getMethod("getPortNum");
                 Object s = getSrv.invoke(session);
                 Object p = getPort.invoke(session);
-                println("  Server=" + s + ":" + p);
+                System.out.println("  Server=" + s + ":" + p);
             } catch (Throwable ignore) {}
 
             try {
                 Method getX = session.getClass().getMethod("getXdsManagementPortNum");
                 Object x = getX.invoke(session);
-                println("  XDSMgmtPort=" + x);
+                System.out.println("  XDSMgmtPort=" + x);
             } catch (Throwable ignore) {}
 
             System.exit(0);
