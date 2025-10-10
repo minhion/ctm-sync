@@ -24,7 +24,6 @@ public final class HfmCli {
         m.setAccessible(true);
         return m.invoke(null, args);
     }
-    // swallow exceptions -> boolean success
     private static boolean safeCall(Object tgt, String name, Class<?>[] sig, Object... args) {
         try { call(tgt, name, sig, args); return true; } catch (Throwable ignore) { return false; }
     }
@@ -52,7 +51,7 @@ public final class HfmCli {
         return (v == null || v instanceof Boolean) ? null : v.toString();
     }
 
-    // ---------- login (no inline try blocks) ----------
+    // ---------- login ----------
     private static Object tryLogin(String user, String pass, String cluster, String provider, String domain, String server) {
         if (user == null || pass == null) return null;
 
@@ -63,9 +62,9 @@ public final class HfmCli {
         String[] secGetters = { "getSecurityService", "getSecurityClient", "security", "getSecurity" };
         String[] loginNames = { "login", "authenticate", "logon" };
 
-        for (int i = 0; i < factoryNames.length; i++) {
+        for (String fname : factoryNames) {
             try {
-                Class<?> facClz = clz(factoryNames[i]);
+                Class<?> facClz = clz(fname);
 
                 Object factory = safeStaticRet(facClz, "getInstance", new Class<?>[] {});
                 if (factory == null) {
@@ -73,7 +72,7 @@ public final class HfmCli {
                 }
                 if (factory == null) continue;
 
-                // optional hints
+                // optional hints on factory
                 if (provider != null) {
                     safeCall(factory, "setProvider",    new Class<?>[]{String.class}, provider);
                     safeCall(factory, "setProviderURL", new Class<?>[]{String.class}, provider);
@@ -93,11 +92,13 @@ public final class HfmCli {
                 }
 
                 Object sec = null;
-                for (int g = 0; g < secGetters.length && sec == null; g++) {
-                    sec = safeCallRet(factory, secGetters[g], new Class<?>[] {});
+                for (String g : secGetters) {
+                    if (sec != null) break;
+                    sec = safeCallRet(factory, g, new Class<?>[] {});
                 }
                 if (sec == null) continue;
 
+                // optional hints on client
                 if (provider != null) {
                     safeCall(sec, "setProvider",    new Class<?>[]{String.class}, provider);
                     safeCall(sec, "setProviderURL", new Class<?>[]{String.class}, provider);
@@ -117,16 +118,15 @@ public final class HfmCli {
                 }
 
                 // attempt common signatures
-                for (int m = 0; m < loginNames.length; m++) {
-                    Object r = safeCallRet(sec, loginNames[m],
+                for (String ln : loginNames) {
+                    Object r = safeCallRet(sec, ln,
                             new Class<?>[]{String.class,String.class,String.class}, user, pass, cluster);
                     if (r != null) return r;
 
-                    r = safeCallRet(sec, loginNames[m],
-                            new Class<?>[]{String.class,String.class}, user, pass);
+                    r = safeCallRet(sec, ln, new Class<?>[]{String.class,String.class}, user, pass);
                     if (r != null) return r;
 
-                    r = safeCallRet(sec, loginNames[m],
+                    r = safeCallRet(sec, ln,
                             new Class<?>[]{String.class,String.class,String.class}, user, pass, domain);
                     if (r != null) return r;
                 }
@@ -184,8 +184,21 @@ public final class HfmCli {
 
             Object sessionInfo = tryLogin(user, pass, cluster, provider, domain, server);
             if (sessionInfo != null) {
+                // object (some builds use this)
                 params.put("sessionInfo", sessionInfo);
                 params.put("SessionInfo", sessionInfo);
+
+                // ALSO provide raw SessionID string (other builds require this)
+                try {
+                    Method getSid = sessionInfo.getClass().getMethod("getSessionId");
+                    Object sid = getSid.invoke(sessionInfo);
+                    if (sid != null) {
+                        String s = sid.toString();
+                        params.put("SessionID", s);
+                        params.put("SessionId", s);
+                        params.put("sessionId", s);
+                    }
+                } catch (Throwable ignore) {}
             }
 
             if (dryRun) {
