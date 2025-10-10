@@ -5,159 +5,156 @@ import java.util.*;
 
 public class HfmCli {
 
-    public static void main(String[] args) {
-        long t0 = System.currentTimeMillis();
-        Map<String,String> kv = parse(args);
+  private static Class<?> clz(String name) throws ClassNotFoundException {
+    return Class.forName(name);
+  }
 
-        if (!"consolidate".equalsIgnoreCase(kv.getOrDefault("_sub",""))) {
-            fail(2, "Use: Consolidate --application APP --consolidationType TYPE --pov \"CSV\"");
+  private static Object newInstance(Class<?> c) throws Exception {
+    try { return c.getDeclaredConstructor().newInstance(); }
+    catch (NoSuchMethodException e) { return c.newInstance(); }
+  }
+
+  private static Object call(Object target, String name, Class<?>[] sig, Object... args) throws Exception {
+    Method m = target.getClass().getMethod(name, sig);
+    m.setAccessible(true);
+    return m.invoke(target, args);
+  }
+
+  private static Object callStatic(Class<?> c, String name, Class<?>[] sig, Object... args) throws Exception {
+    Method m = c.getMethod(name, sig);
+    m.setAccessible(true);
+    return m.invoke(null, args);
+  }
+
+  private static Map<String,Object> argMap(String[] argv) {
+    Map<String,Object> out = new LinkedHashMap<>();
+    String k = null;
+    for (String a : argv) {
+      if (a.startsWith("--")) {
+        k = a.substring(2);
+        out.put(k, Boolean.TRUE); // default
+      } else if (k != null) {
+        out.put(k, a);
+        k = null;
+      }
+    }
+    return out;
+  }
+
+  public static void main(String[] args) {
+    long t0 = System.currentTimeMillis();
+    Map<String,Object> a = argMap(args);
+
+    String op   = args.length > 0 ? args[0] : "Consolidate";
+    String app  = (String) a.get("application");
+    String type = (String) a.getOrDefault("consolidationType","AllWithData");
+    String pov  = (String) a.get("pov");
+
+    // creds (prefer -D props set by CTM wrapper, otherwise --user/--password/--cluster)
+    String user    = System.getProperty("HFM_USER",    (String) a.get("user"));
+    String pass    = System.getProperty("HFM_PASSWORD",(String) a.get("password"));
+    String cluster = (String) a.get("cluster");
+
+    boolean dryRun = Boolean.parseBoolean(String.valueOf(a.getOrDefault("dryRun","false")));
+
+    try {
+      if (!"Consolidate".equalsIgnoreCase(op)) {
+        System.out.println(jsonErr("Only Consolidate supported right now")); System.exit(2);
+      }
+      if (app==null || pov==null) {
+        System.out.println(jsonErr("Missing --application and/or --pov")); System.exit(2);
+      }
+      // Build parameters map expected by ConsolidateAction
+      Map<String,Object> params = new LinkedHashMap<>();
+      params.put("Application", app);
+      params.put("POV", pov);
+      params.put("Type", type);
+
+      // ---- Login to obtain SessionInfo (critical) ----
+      Object sessionInfo = null;
+      if (user!=null && pass!=null) {
+        sessionInfo = tryLogin(user, pass, cluster);
+        if (sessionInfo == null) {
+          System.out.println(jsonErr("Auth action returned no SessionInfo (check keys: User/Password[/Cluster])"));
+          System.exit(5);
         }
+        // common keys used by vendor tooling
+        params.put("sessionInfo", sessionInfo);
+        params.put("SessionInfo", sessionInfo);
+      }
 
-        final String app   = req(kv, "--application");
-        final String type  = req(kv, "--consolidationType");
-        final String pov   = req(kv, "--pov");
-        final boolean dry  = Boolean.parseBoolean(kv.getOrDefault("--dryRun", "false"));
-
-        final String cluster  = kv.getOrDefault("--cluster",  "");
-        final String server   = kv.getOrDefault("--server",   "");
-        final String provider = kv.getOrDefault("--provider", "");
-        final String domain   = kv.getOrDefault("--domain",   "");
-        final String locale   = kv.getOrDefault("--locale",   "");
-
-        if (dry) ok(t0, app, "Dry run OK (args validated).");
-
-        final String user = System.getProperty("HFM_USER", "");
-        final String pass = System.getProperty("HFM_PASSWORD", "");
-        if (user.isEmpty() || pass.isEmpty()) fail(3, "Missing -DHFM_USER / -DHFM_PASSWORD");
-
-        final String epmInst = System.getProperty("EPM_ORACLE_INSTANCE", "");
-        if (epmInst.trim().isEmpty()) fail(4, "Missing -DEPM_ORACLE_INSTANCE");
-
-        // Base map used across actions; include many key variants to satisfy different builds
-        Map<String,Object> base = new HashMap<>();
-        base.put("User", user);
-        base.put("Username", user);
-        base.put("Password", pass);
-        if (!cluster.isEmpty())  base.put("Cluster",  cluster);
-        if (!server.isEmpty())   base.put("Server",   server);
-        if (!provider.isEmpty()) base.put("Provider", provider);
-        if (!domain.isEmpty())   base.put("Domain",   domain);
-        if (!locale.isEmpty())   base.put("Locale",   locale);
-
-        Object session = null;
-        try {
-            // 1) AUTH
-            session = tryAuth(base, new String[]{
-                "oracle.epm.fm.actions.LogonAction",
-                "oracle.epm.fm.actions.LoginAction",
-                "oracle.epm.fm.actions.AuthenticateAction",
-                "oracle.epm.fm.actions.SignInAction"
-            });
-
-            if (session == null) {
-                fail(5, "Auth action returned no SessionInfo (try passing --cluster/--provider/--server or verify account)");
-            }
-
-            // 2) OPEN APP (best effort)
-            Map<String,Object> openMap = new HashMap<>(base);
-            openMap.put("SessionInfo", session);
-            // support app name under multiple keys
-            openMap.put("Application", app);
-            openMap.put("AppName", app);
-            openMap.put("ApplicationName", app);
-            execActionIfPresent("oracle.epm.fm.actions.OpenApplicationAction", openMap);
-
-            // 3) SET POV (best effort)
-            Map<String,Object> povMap = new HashMap<>(openMap);
-            povMap.put("POV", pov);
-            execActionIfPresent("oracle.epm.fm.actions.SetPOVAction", povMap);
-
-            // 4) CONSOLIDATE (confirmed in your build)
-            Map<String,Object> consMap = new HashMap<>(openMap);
-            consMap.put("POV", pov);
-            consMap.put("ConsolidationType", type);
-            boolean ok = execConsolidate(consMap);
-            if (!ok) fail(7, "Consolidate returned false");
-
-            // 5) CLOSE + LOGOUT (best effort)
-            execActionIfPresent("oracle.epm.fm.actions.CloseApplicationAction", openMap);
-            Map<String,Object> logoutMap = new HashMap<>(base);
-            logoutMap.put("SessionInfo", session);
-            execActionIfPresent("oracle.epm.fm.actions.LogoutAction", logoutMap);
-
-            ok(t0, app, "Consolidation invoked");
-        } catch (InvocationTargetException ite) {
-            Throwable root = ite.getTargetException();
-            fail(6, "HFM error: " + root.getClass().getName() + ": " + safe(root.getMessage()));
-        } catch (Throwable t) {
-            fail(6, t.getClass().getName() + ": " + safe(t.getMessage()));
-        }
-    }
-
-    /* =================== Action glue =================== */
-
-    private static Object tryAuth(Map<String,Object> base, String[] classNames) throws Exception {
-        for (String cn : classNames) {
-            try {
-                Class<?> c = Class.forName(cn);
-                Object action = c.getDeclaredConstructor().newInstance();
-                Method exec = c.getMethod("execute", Map.class);
-                Object si = exec.invoke(action, base);
-                if (si != null) return si;
-
-                // some builds put SessionInfo into the map or expose getter
-                if (base.containsKey("SessionInfo")) return base.get("SessionInfo");
-                try {
-                    Method g = c.getMethod("getSessionInfo");
-                    Object s2 = g.invoke(action);
-                    if (s2 != null) return s2;
-                } catch (NoSuchMethodException ignored) {}
-            } catch (ClassNotFoundException ignored) {}
-        }
-        return null;
-    }
-
-    private static void execActionIfPresent(String className, Map<String,Object> params) throws Exception {
-        try {
-            Class<?> c = Class.forName(className);
-            Object action = c.getDeclaredConstructor().newInstance();
-            Method exec = c.getMethod("execute", Map.class);
-            exec.invoke(action, params);
-        } catch (ClassNotFoundException ignored) {}
-    }
-
-    private static boolean execConsolidate(Map<String,Object> params) throws Exception {
-        Class<?> c = Class.forName("oracle.epm.fm.actions.ConsolidateAction");
-        Object action = c.getDeclaredConstructor().newInstance();
-        Method exec = c.getMethod("execute", Map.class);
-        Object r = exec.invoke(action, params);
-        return (r instanceof Boolean) ? (Boolean) r : true;
-    }
-
-    /* =================== utils =================== */
-
-    private static Map<String,String> parse(String[] args){
-        Map<String,String> m = new LinkedHashMap<>();
-        if (args.length>0) m.put("_sub", args[0]);
-        for (int i=1;i<args.length;i++){
-            if (args[i].startsWith("--") && i+1<args.length) m.put(args[i], args[++i]);
-        }
-        return m;
-    }
-    private static String req(Map<String,String> m, String k){
-        String v = m.get(k);
-        if (v==null || v.isEmpty()) fail(2, "Missing arg: "+k);
-        return v;
-    }
-    private static void ok(long t0, String app, String msg){
-        long ms = System.currentTimeMillis()-t0;
-        System.out.println("{\"status\":\"OK\",\"application\":\""+esc(app)+"\",\"elapsed_ms\":"+ms+",\"message\":\""+esc(msg)+"\"}");
+      if (dryRun) {
+        System.out.println("{\"status\":\"OK\",\"message\":\"DRY RUN\",\"application\":\""+app+"\"}");
         System.exit(0);
+      }
+
+      // ---- Execute ConsolidateAction ----
+      Class<?> actClz = clz("oracle.epm.fm.actions.ConsolidateAction");
+      Object action = newInstance(actClz);
+
+      // method: boolean execute(Map<String,String>) — some builds accept (Map) with non-String values
+      Method exec = null;
+      for (Method m : actClz.getMethods()) {
+        if (m.getName().equals("execute") && m.getParameterCount()==1) {
+          exec = m; break;
+        }
+      }
+      if (exec == null) {
+        System.out.println(jsonErr("Bind error: no execute(Map) on ConsolidateAction"));
+        System.exit(5);
+      }
+      Object ok = exec.invoke(action, params);
+      boolean success = (ok instanceof Boolean) ? (Boolean) ok : true;
+
+      long ms = System.currentTimeMillis() - t0;
+      if (success) {
+        System.out.println("{\"status\":\"OK\",\"application\":\""+app+"\",\"elapsed_ms\":"+ms+"}");
+        System.exit(0);
+      } else {
+        System.out.println(jsonErr("Consolidate returned false"));
+        System.exit(6);
+      }
+    } catch (Throwable t) {
+      t.printStackTrace();
+      System.out.println(jsonErr(t.getClass().getSimpleName()+": "+t.getMessage()));
+      System.exit(5);
     }
-    private static void fail(int code, String msg){
-        System.out.println("{\"status\":\"Error\",\"message\":\""+esc(msg)+"\"}");
-        System.exit(code);
+  }
+
+  private static Object tryLogin(String user, String pass, String cluster) {
+    try {
+      // Typical path: ServiceClientFactory -> SecurityService -> login/authenticate -> SessionInfo
+      // Try several common signatures via reflection
+      Class<?> factoryClz = clz("oracle.epm.fm.common.service.ServiceClientFactory");
+      Object  factory     = newInstance(factoryClz);
+
+      // try getSecurityService() / getSecurityClient()
+      Object sec = null;
+      for (String m : new String[]{"getSecurityService","getSecurityClient"}) {
+        try { sec = call(factory, m, new Class<?>[]{}); if (sec!=null) break; } catch (Throwable ignore) {}
+      }
+      if (sec == null) return null;
+
+      // candidate auth method names
+      String[] names = {"login","authenticate","logon"};
+      // candidate signatures: (String,String,String) and (String,String)
+      for (String m : names) {
+        try {
+          return call(sec, m, new Class<?>[]{String.class,String.class,String.class}, user, pass, cluster);
+        } catch (NoSuchMethodException e) { /* try next */ }
+        catch (Throwable ok) { return ok; }
+        try {
+          return call(sec, m, new Class<?>[]{String.class,String.class}, user, pass);
+        } catch (NoSuchMethodException e) { /* try next */ }
+        catch (Throwable ok) { return ok; }
+      }
+    } catch (Throwable ignore) {
+      // fall through
     }
-    private static String esc(String s){ return s==null?"":s.replace("\"","\\\""); }
-    private static String safe(String s){ return s==null?"":s.replace("\"","\\\"").replace("\n"," ").replace("\r"," "); }
+    return null;
+  }
+
+  private static String jsonErr(String m) {
+    return "{\"status\":\"Error\",\"message\":\""+m.replace("\"","'")+"\"}";
+  }
 }
