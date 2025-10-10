@@ -102,4 +102,46 @@ public final class HfmLoginProbe {
 
     public static void main(String[] args) {
         String user     = getPropOrNull("HFM_USER");
-        String pass     = getPropOrNull("H
+        String pass     = getPropOrNull("HFM_PASSWORD");
+        String cluster  = (args.length > 0) ? args[0] : null;
+        String provider = getPropOrNull("HFM_PROVIDER");
+        String domain   = getPropOrNull("HFM_DOMAIN");
+        String server   = getPropOrNull("HFM_SERVER");
+
+        println("=== HfmLoginProbe ===");
+        println("user=" + user);
+        println("cluster=" + cluster + " domain=" + domain + " server=" + server + " provider=" + provider);
+
+        Object session = tryLogin(user, pass, cluster, provider, domain, server);
+        if (session == null) {
+            System.out.println("RESULT: Login returned NULL SessionInfo.");
+            System.exit(2);
+        }
+
+        try {
+            Method getSid = session.getClass().getMethod("getSessionId");
+            Object sid = getSid.invoke(session);
+            println("SessionInfo OK");
+            println("  SessionId=" + sid);
+
+            try {
+                Method getSrv = session.getClass().getMethod("getServerName");
+                Method getPort = session.getClass().getMethod("getPortNum");
+                Object s = getSrv.invoke(session);
+                Object p = getPort.invoke(session);
+                println("  Server=" + s + ":" + p);
+            } catch (Throwable ignore) {}
+
+            try {
+                Method getX = session.getClass().getMethod("getXdsManagementPortNum");
+                Object x = getX.invoke(session);
+                println("  XDSMgmtPort=" + x);
+            } catch (Throwable ignore) {}
+
+            System.exit(0);
+        } catch (Throwable t) {
+            t.printStackTrace(System.err);
+            System.exit(3);
+        }
+    }
+}
