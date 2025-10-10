@@ -6,153 +6,131 @@ import java.util.Map;
 
 public final class HfmCli {
 
-    // ---------- utils ----------
+    // ---------- reflect helpers ----------
     private static Class<?> clz(String name) throws ClassNotFoundException {
         return Class.forName(name);
     }
-
     private static Object newInstance(Class<?> c) throws Exception {
         try { return c.getDeclaredConstructor().newInstance(); }
         catch (NoSuchMethodException e) { return c.newInstance(); }
     }
-
     private static Object call(Object target, String name, Class<?>[] sig, Object... args) throws Exception {
         Method m = target.getClass().getMethod(name, sig);
         m.setAccessible(true);
         return m.invoke(target, args);
     }
-
     private static Object callStatic(Class<?> c, String name, Class<?>[] sig, Object... args) throws Exception {
         Method m = c.getMethod(name, sig);
         m.setAccessible(true);
         return m.invoke(null, args);
     }
+    // swallow exceptions -> boolean success
+    private static boolean safeCall(Object tgt, String name, Class<?>[] sig, Object... args) {
+        try { call(tgt, name, sig, args); return true; } catch (Throwable ignore) { return false; }
+    }
+    private static Object safeCallRet(Object tgt, String name, Class<?>[] sig, Object... args) {
+        try { return call(tgt, name, sig, args); } catch (Throwable ignore) { return null; }
+    }
+    private static Object safeStaticRet(Class<?> c, String name, Class<?>[] sig, Object... args) {
+        try { return callStatic(c, name, sig, args); } catch (Throwable ignore) { return null; }
+    }
 
+    // ---------- small utils ----------
     private static String jsonErr(String m) {
         return "{\"status\":\"Error\",\"message\":\"" + (m == null ? "" : m.replace("\"","'")) + "\"}";
     }
-
     private static Map<String,Object> argMap(String[] argv) {
         Map<String,Object> out = new LinkedHashMap<String,Object>();
         String k = null;
         for (String a : argv) {
-            if (a.startsWith("--")) {
-                k = a.substring(2);
-                out.put(k, Boolean.TRUE);            // presence-only default
-            } else if (k != null) {
-                out.put(k, a);
-                k = null;
-            }
+            if (a.startsWith("--")) { k = a.substring(2); out.put(k, Boolean.TRUE); }
+            else if (k != null) { out.put(k, a); k = null; }
         }
         return out;
     }
-
     private static String asString(Object v) {
         return (v == null || v instanceof Boolean) ? null : v.toString();
     }
 
-    // ---------- login ----------
-    /**
-     * Attempt to obtain a SessionInfo by reflecting common HFM security APIs.
-     * Returns the SessionInfo object (any type), or null if not available.
-     */
+    // ---------- login (no inline try blocks) ----------
     private static Object tryLogin(String user, String pass, String cluster, String provider, String domain, String server) {
         if (user == null || pass == null) return null;
 
-        String[] factoryNames = new String[] {
+        String[] factoryNames = {
             "oracle.epm.fm.common.service.ServiceClientFactory",
             "oracle.epm.fm.common.service.client.ServiceClientFactory"
         };
-        String[] secGetters = new String[] { "getSecurityService", "getSecurityClient", "security", "getSecurity" };
-        String[] loginNames = new String[] { "login", "authenticate", "logon" };
+        String[] secGetters = { "getSecurityService", "getSecurityClient", "security", "getSecurity" };
+        String[] loginNames = { "login", "authenticate", "logon" };
 
         for (int i = 0; i < factoryNames.length; i++) {
-            String facName = factoryNames[i];
             try {
-                Class<?> facClz = clz(facName);
-                Object factory = null;
-                try {
-                    factory = callStatic(facClz, "getInstance", new Class<?>[] { });
-                } catch (Throwable ign) {
-                    try { factory = newInstance(facClz); } catch (Throwable t2) { factory = null; }
+                Class<?> facClz = clz(factoryNames[i]);
+
+                Object factory = safeStaticRet(facClz, "getInstance", new Class<?>[] {});
+                if (factory == null) {
+                    try { factory = newInstance(facClz); } catch (Throwable ignore) { factory = null; }
                 }
                 if (factory == null) continue;
 
-                // Try to set connection hints on the factory
+                // optional hints
                 if (provider != null) {
-                    try { call(factory, "setProvider",    new Class<?>[]{String.class}, provider); } catch (Throwable ign) {}
-                    try { call(factory, "setProviderURL", new Class<?>[]{String.class}, provider); } catch (Throwable ign) {}
-                    try { call(factory, "setProviderUrl", new Class<?>[]{String.class}, provider); } catch (Throwable ign) {}
+                    safeCall(factory, "setProvider",    new Class<?>[]{String.class}, provider);
+                    safeCall(factory, "setProviderURL", new Class<?>[]{String.class}, provider);
+                    safeCall(factory, "setProviderUrl", new Class<?>[]{String.class}, provider);
                 }
                 if (domain != null) {
-                    try { call(factory, "setDomain",     new Class<?>[]{String.class}, domain); } catch (Throwable ign) {}
-                    try { call(factory, "setDomainName", new Class<?>[]{String.class}, domain); } catch (Throwable ign) {}
+                    safeCall(factory, "setDomain",     new Class<?>[]{String.class}, domain);
+                    safeCall(factory, "setDomainName", new Class<?>[]{String.class}, domain);
                 }
                 if (server != null) {
-                    try { call(factory, "setServer",     new Class<?>[]{String.class}, server); } catch (Throwable ign) {}
-                    try { call(factory, "setServerName", new Class<?>[]{String.class}, server); } catch (Throwable ign) {}
+                    safeCall(factory, "setServer",     new Class<?>[]{String.class}, server);
+                    safeCall(factory, "setServerName", new Class<?>[]{String.class}, server);
                 }
                 if (cluster != null) {
-                    try { call(factory, "setCluster",     new Class<?>[]{String.class}, cluster); } catch (Throwable ign) {}
-                    try { call(factory, "setClusterName", new Class<?>[]{String.class}, cluster); } catch (Throwable ign) {}
+                    safeCall(factory, "setCluster",     new Class<?>[]{String.class}, cluster);
+                    safeCall(factory, "setClusterName", new Class<?>[]{String.class}, cluster);
                 }
 
                 Object sec = null;
                 for (int g = 0; g < secGetters.length && sec == null; g++) {
-                    try { sec = call(factory, secGetters[g], new Class<?>[] { }); } catch (Throwable ign) {}
+                    sec = safeCallRet(factory, secGetters[g], new Class<?>[] {});
                 }
                 if (sec == null) continue;
 
-                // Set hints on the security client as well
                 if (provider != null) {
-                    try { call(sec, "setProvider",    new Class<?>[]{String.class}, provider); } catch (Throwable ign) {}
-                    try { call(sec, "setProviderURL", new Class<?>[]{String.class}, provider); } catch (Throwable ign) {}
-                    try { call(sec, "setProviderUrl", new Class<?>[]{String.class}, provider); } catch (Throwable ign) {}
+                    safeCall(sec, "setProvider",    new Class<?>[]{String.class}, provider);
+                    safeCall(sec, "setProviderURL", new Class<?>[]{String.class}, provider);
+                    safeCall(sec, "setProviderUrl", new Class<?>[]{String.class}, provider);
                 }
                 if (domain != null) {
-                    try { call(sec, "setDomain",     new Class<?>[]{String.class}, domain); } catch (Throwable ign) {}
-                    try { call(sec, "setDomainName", new Class<?>[]{String.class}, domain); } catch (Throwable ign) {}
+                    safeCall(sec, "setDomain",     new Class<?>[]{String.class}, domain);
+                    safeCall(sec, "setDomainName", new Class<?>[]{String.class}, domain);
                 }
                 if (server != null) {
-                    try { call(sec, "setServer",     new Class<?>[]{String.class}, server); } catch (Throwable ign) {}
-                    try { call(sec, "setServerName", new Class<?>[]{String.class}, server); } catch (Throwable ign) {}
+                    safeCall(sec, "setServer",     new Class<?>[]{String.class}, server);
+                    safeCall(sec, "setServerName", new Class<?>[]{String.class}, server);
                 }
                 if (cluster != null) {
-                    try { call(sec, "setCluster",     new Class<?>[]{String.class}, cluster); } catch (Throwable ign) {}
-                    try { call(sec, "setClusterName", new Class<?>[]{String.class}, cluster); } catch (Throwable ign) {}
+                    safeCall(sec, "setCluster",     new Class<?>[]{String.class}, cluster);
+                    safeCall(sec, "setClusterName", new Class<?>[]{String.class}, cluster);
                 }
 
-                // Try common login signatures
+                // attempt common signatures
                 for (int m = 0; m < loginNames.length; m++) {
-                    try {
-                        return call(sec, loginNames[m],
-                                    new Class<?>[] { String.class, String.class, String.class },
-                                    user, pass, cluster);
-                    } catch (NoSuchMethodException ns1) {
-                        // next signature
-                    } catch (Throwable ok3) {
-                        return ok3; // some builds return a SessionInfo or throwable
-                    }
-                    try {
-                        return call(sec, loginNames[m],
-                                    new Class<?>[] { String.class, String.class },
-                                    user, pass);
-                    } catch (NoSuchMethodException ns2) {
-                        // next signature
-                    } catch (Throwable ok2) {
-                        return ok2;
-                    }
-                    try {
-                        return call(sec, loginNames[m],
-                                    new Class<?>[] { String.class, String.class, String.class },
-                                    user, pass, domain);
-                    } catch (NoSuchMethodException ns3) {
-                        // next method
-                    } catch (Throwable ok1) {
-                        return ok1;
-                    }
+                    Object r = safeCallRet(sec, loginNames[m],
+                            new Class<?>[]{String.class,String.class,String.class}, user, pass, cluster);
+                    if (r != null) return r;
+
+                    r = safeCallRet(sec, loginNames[m],
+                            new Class<?>[]{String.class,String.class}, user, pass);
+                    if (r != null) return r;
+
+                    r = safeCallRet(sec, loginNames[m],
+                            new Class<?>[]{String.class,String.class,String.class}, user, pass, domain);
+                    if (r != null) return r;
                 }
-            } catch (Throwable ignoreAll) {
+            } catch (Throwable ignore) {
                 // try next factory
             }
         }
@@ -170,12 +148,12 @@ public final class HfmCli {
         if (type == null || type.isEmpty()) type = "AllWithData";
         String pov  = asString(a.get("pov"));
 
-        String user    = System.getProperty("HFM_USER",     asString(a.get("user")));
-        String pass    = System.getProperty("HFM_PASSWORD", asString(a.get("password")));
-        String cluster = asString(a.get("cluster"));
-        String provider= asString(a.get("provider"));
-        String domain  = asString(a.get("domain"));
-        String server  = asString(a.get("server"));
+        String user     = System.getProperty("HFM_USER",     asString(a.get("user")));
+        String pass     = System.getProperty("HFM_PASSWORD", asString(a.get("password")));
+        String cluster  = asString(a.get("cluster"));
+        String provider = asString(a.get("provider"));
+        String domain   = asString(a.get("domain"));
+        String server   = asString(a.get("server"));
 
         boolean dryRun = Boolean.parseBoolean(String.valueOf(a.getOrDefault("dryRun","false")));
 
@@ -189,7 +167,7 @@ public final class HfmCli {
                 System.exit(2);
             }
 
-            // Build parameter map with synonyms
+            // param map with synonyms
             Map<String,Object> params = new LinkedHashMap<String,Object>();
             params.put("Application", app);
             params.put("ApplicationName", app);
@@ -197,14 +175,13 @@ public final class HfmCli {
             params.put("ConsolidationType", type);
             params.put("Type", type);
 
-            if (cluster != null) { params.put("Cluster", cluster); params.put("ClusterName", cluster); }
-            if (provider!= null) { params.put("Provider", provider); params.put("ProviderURL", provider); params.put("ProviderUrl", provider); }
-            if (domain  != null) { params.put("Domain", domain); params.put("DomainName", domain); }
-            if (server  != null) { params.put("Server", server); params.put("ServerName", server); }
-            if (user    != null) { params.put("User", user); params.put("Username", user); }
-            if (pass    != null) { params.put("Password", pass); }
+            if (cluster  != null) { params.put("Cluster", cluster); params.put("ClusterName", cluster); }
+            if (provider != null) { params.put("Provider", provider); params.put("ProviderURL", provider); params.put("ProviderUrl", provider); }
+            if (domain   != null) { params.put("Domain", domain); params.put("DomainName", domain); }
+            if (server   != null) { params.put("Server", server); params.put("ServerName", server); }
+            if (user     != null) { params.put("User", user); params.put("Username", user); }
+            if (pass     != null) { params.put("Password", pass); }
 
-            // Try to get SessionInfo
             Object sessionInfo = tryLogin(user, pass, cluster, provider, domain, server);
             if (sessionInfo != null) {
                 params.put("sessionInfo", sessionInfo);
@@ -216,15 +193,14 @@ public final class HfmCli {
                 System.exit(0);
             }
 
-            // Execute ConsolidateAction
+            // execute Consolidate
             Class<?> actClz = clz("oracle.epm.fm.actions.ConsolidateAction");
-            Object action = newInstance(actClz);
+            Object action   = newInstance(actClz);
 
             Method exec = null;
-            Method[] ms = actClz.getMethods();
-            for (int i = 0; i < ms.length; i++) {
-                if ("execute".equals(ms[i].getName()) && ms[i].getParameterCount() == 1) {
-                    exec = ms[i]; break;
+            for (Method m : actClz.getMethods()) {
+                if ("execute".equals(m.getName()) && m.getParameterTypes().length == 1) {
+                    exec = m; break;
                 }
             }
             if (exec == null) {
@@ -235,9 +211,9 @@ public final class HfmCli {
             Object ok = exec.invoke(action, params);
             boolean success = !(ok instanceof Boolean) || ((Boolean) ok).booleanValue();
 
-            long msElapsed = System.currentTimeMillis() - t0;
+            long ms = System.currentTimeMillis() - t0;
             if (success) {
-                System.out.println("{\"status\":\"OK\",\"application\":\""+app+"\",\"elapsed_ms\":"+msElapsed+"}");
+                System.out.println("{\"status\":\"OK\",\"application\":\""+app+"\",\"elapsed_ms\":"+ms+"}");
                 System.exit(0);
             } else {
                 System.out.println(jsonErr("Consolidate returned false"));
