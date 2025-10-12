@@ -1,18 +1,19 @@
 /*
     HFM Java API Code Example: Run a consolidation
 
-    Author: Henri Vilminko / Infratects
-    Date: 2016-06-10
+    Original Author: Henri Vilminko / Infratects
+    Updated: adds consolidation type switch, safer polling, clearer diagnostics.
+
+    Usage examples:
+      java project1.HFMcons -u admin -p p4ssw0rd -a HCHFM -c HCHFMQ -s "S#Actual.Y#2025.P#Aug;Sep.E#CO_J00000"
+      java project1.HFMcons --list-types
+      java project1.HFMcons -u ... -p ... -a ... -c ... -t allwithdata -s "<POV>"
+      java project1.HFMcons -u ... -p ... -a ... -c ... -t impacted -s "<POV>"
+      java project1.HFMcons -u ... -p ... -a ... -c ... -t WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA -s "<POV>"
 
     Notes:
-    - Updated by Minh's helper to add:
-      * taskInfo/taskIDs sanity print
-      * small delay before first poll (avoids Systeminfo race)
-      * guarded polling with limited retries for getCurrentTaskProgress
-      * clearer error if no task IDs were returned (likely bad POV)
-
-    Sample command line:
-    java project1.HFMcons -u admin -p p4ssw0rd -a COMMA4DIM -c SANDBOX -s "S#Actual.Y#2007.P#June;July;August.E#EastRegion"
+      - POV = Point-of-View string like: S#Scenario.Y#Year.P#Period(s).E#Entity[.Vw#View][.V#Value][.A#Account][.I#ICP][.C1#...]
+      - Default consolidation type = AllWithData (alias: allwithdata)
 */
 
 package project1;
@@ -37,140 +38,129 @@ import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 
 public class HFMcons {
+
     public static void main(String[] args) {
 
         String username = "";
         String password = "";
-        String appName = "";
+        String appName  = "";
         String ssoToken = "";
         String hfmCluster = "";
         String dataSlice = "";
+
+        // New: consolidation type selection
+        String typeArg = "allwithdata"; // default
+        boolean listTypes = false;
+
         SessionOM sessionOM = null;
         SessionInfo session = null;
 
         try {
-            // Parse the command line options
+            // Parse CLI
             Options opt = new Options();
-
             opt.addOption("h", "help", false, "Print help for this application");
-            opt.addOption("u", "user", true, "Username for login");
+            opt.addOption("u", "user", true,  "Username for login");
             opt.addOption("p", "password", true, "Password for login");
-            opt.addOption("a", "app", true, "HFM application name");
+            opt.addOption("a", "app", true,  "HFM application name");
             opt.addOption("c", "cluster", true, "HFM cluster name");
-            opt.addOption("s", "slice", true, "Data slice definition");
+            opt.addOption("s", "slice", true, "POV data slice (e.g., S#Actual.Y#2025.P#Aug;Sep.E#Entity)");
+            opt.addOption("t", "type", true,  "Consolidation type (alias or raw enum). Try: allwithdata|all|impacted|entityonly|force-entityonly");
+            opt.addOption(null, "list-types", false, "List available WEBOMDATAGRIDTASKMASKENUM values and exit");
 
             BasicParser parser = new BasicParser();
             CommandLine cl = parser.parse(opt, args);
 
+            if (cl.hasOption("list-types")) {
+                listTypes = true;
+            }
             if (cl.hasOption('h')) {
                 HelpFormatter f = new HelpFormatter();
                 f.printHelp("HFMcons", opt);
                 System.exit(0);
             }
 
-            if (cl.hasOption('u')) {
-                username = cl.getOptionValue("u");
-            } else {
-                System.err.println("Error: Username is mandatory (use the -u option).");
-                System.exit(1);
+            if (cl.hasOption('u')) username   = cl.getOptionValue("u"); else { System.err.println("Error: Username (-u) is required."); System.exit(1); }
+            if (cl.hasOption('p')) password   = cl.getOptionValue("p"); else { System.err.println("Error: Password (-p) is required."); System.exit(1); }
+            if (cl.hasOption('a')) appName    = cl.getOptionValue("a"); else { System.err.println("Error: Application (-a) is required."); System.exit(1); }
+            if (cl.hasOption('c')) hfmCluster = cl.getOptionValue("c"); else { System.err.println("Error: Cluster (-c) is required."); System.exit(1); }
+            if (cl.hasOption('s')) dataSlice  = cl.getOptionValue("s");
+            if (cl.hasOption('t')) typeArg    = cl.getOptionValue("t");
+
+            if (listTypes) {
+                System.out.println("Available WEBOMDATAGRIDTASKMASKENUM values:");
+                for (WEBOMDATAGRIDTASKMASKENUM e : WEBOMDATAGRIDTASKMASKENUM.values()) {
+                    System.out.println(" - " + e.name());
+                }
+                System.exit(0);
             }
 
-            if (cl.hasOption('p')) {
-                password = cl.getOptionValue("p");
-            } else {
-                System.err.println("Error: Password is mandatory (use the -p option).");
-                System.exit(1);
-            }
-
-            if (cl.hasOption('a')) {
-                appName = cl.getOptionValue("a");
-            } else {
-                System.err.println("Error: Application is mandatory (use the -a option).");
-                System.exit(1);
-            }
-
-            if (cl.hasOption('c')) {
-                hfmCluster = cl.getOptionValue("c");
-            } else {
-                System.err.println("Error: Cluster is mandatory (use the -c option).");
-                System.exit(1);
-            }
-
-            if (cl.hasOption('s')) {
-                dataSlice = cl.getOptionValue("s");
-            }
+            // Map friendly aliases to enum; or accept raw enum
+            String enumName = mapTypeToEnum(typeArg);
+            WEBOMDATAGRIDTASKMASKENUM taskEnum = WEBOMDATAGRIDTASKMASKENUM.valueOf(enumName);
 
             System.out.println("Logging in to application " + appName + " with user " + username);
 
-            // Authenticate user to get a security token
+            // Login
             ssoToken = HSSUtilManager.getSecurityManager().authenticateUser(username, password);
 
-            // Create a session to work with an HFM application
+            // Create session
             sessionOM = new SessionOM();
             session = sessionOM.createSession(ssoToken, Locale.ENGLISH, hfmCluster, appName);
 
-            // Create a DataOM object for running data related tasks
+            // Data operations
             DataOM dataOM = new DataOM(session);
 
-            System.out.println("Starting consolidation...");
+            System.out.println("Starting consolidation... Type=" + typeArg + " -> " + taskEnum.name());
 
-            // Consolidate the POV given on command line
             List<String> povs = new ArrayList<String>(1);
             povs.add(dataSlice);
 
-            ServerTaskInfo taskInfo = dataOM.executeServerTask(
-                WEBOMDATAGRIDTASKMASKENUM.valueOf("WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA"),
-                povs
-            );
+            // Execute consolidation task
+            ServerTaskInfo taskInfo = dataOM.executeServerTask(taskEnum, povs);
 
-            // --- Robustness additions start ---
+            // Diagnostics
             System.out.println("DEBUG: taskInfo=" + taskInfo);
             System.out.println("DEBUG: taskIDs=" + (taskInfo == null ? "null" : taskInfo.getTaskIDs()));
 
             if (taskInfo == null || taskInfo.getTaskIDs() == null || taskInfo.getTaskIDs().isEmpty()) {
                 System.err.println("ERROR: No task IDs returned. The POV may be invalid or not consolidatable: " + dataSlice);
-                // Close session before exit
                 if (sessionOM != null && session != null) sessionOM.closeSession(session);
                 System.exit(2);
             }
 
-            // Small delay to avoid Systeminfo handler race on first poll
+            // Small delay before first poll (avoids occasional Systeminfo race)
             try { Thread.sleep(5000); } catch (InterruptedException ie) { /* ignore */ }
 
             AdministrationOM adminOM = new AdministrationOM(session);
 
-            // Guarded polling with a few retries if Systeminfo briefly fails
+            // Poll with limited retries on transient failures
             int pollAttempts = 0;
             final int MAX_POLL_RETRIES = 3;
 
-            Boolean tasksStillRunning = true;
+            boolean tasksStillRunning = true;
             while (tasksStillRunning) {
-
                 List<RunningTaskProgress> listProgress = null;
 
                 try {
                     listProgress = adminOM.getCurrentTaskProgress(taskInfo.getTaskIDs());
-                    // reset attempts on success
-                    pollAttempts = 0;
+                    pollAttempts = 0; // reset on success
                 } catch (Exception pollEx) {
                     pollAttempts++;
                     System.err.println("WARN: getCurrentTaskProgress failed (attempt " + pollAttempts + " of " + MAX_POLL_RETRIES + "): " + pollEx.getMessage());
                     if (pollAttempts <= MAX_POLL_RETRIES) {
                         try { Thread.sleep(3000); } catch (InterruptedException ie) { /* ignore */ }
-                        continue; // retry
+                        continue;
                     } else {
-                        throw pollEx; // give up with original error
+                        throw pollEx;
                     }
                 }
 
-                // If server returned no progress entries, keep a short wait and continue one cycle
                 if (listProgress == null || listProgress.isEmpty()) {
                     try { Thread.sleep(2000); } catch (InterruptedException ie) { /* ignore */ }
                     continue;
                 }
 
-                // Iterate through the list of running tasks, checking status for each.
-                tasksStillRunning = false; // assume done unless we find RUNNING
+                tasksStillRunning = false; // assume done unless we see RUNNING
                 for (RunningTaskProgress taskProgress : listProgress) {
                     System.out.println(
                         "Task #" + taskProgress.getTaskID() + ": " +
@@ -188,11 +178,10 @@ public class HFMcons {
                     try { Thread.sleep(2000); } catch (InterruptedException ie) { /* ignore */ }
                 }
             }
-            // --- Robustness additions end ---
 
             System.out.println("All tasks completed!");
 
-            // All tasks done -> close the session gracefully
+            // Close session gracefully
             if (sessionOM != null && session != null) {
                 sessionOM.closeSession(session);
             }
@@ -200,5 +189,36 @@ public class HFMcons {
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
         }
+    }
+
+    // Map friendly -t/--type aliases to your environment's enum names.
+    // Use --list-types to see the exact constants available and adjust below if needed.
+    private static String mapTypeToEnum(String t) {
+        String v = (t == null ? "" : t.trim().toLowerCase(Locale.ENGLISH));
+
+        // Common aliases → typical enum names (adjust if --list-types shows different names)
+        if (v.equals("allwithdata") || v.equals("all-with-data") || v.equals("awd")) {
+            return "WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA";
+        }
+        if (v.equals("all") || v.equals("full")) {
+            return "WEBOM_DATAGRID_TASK_CONSOLIDATE";
+        }
+        if (v.equals("impacted") || v.equals("delta")) {
+            return "WEBOM_DATAGRID_TASK_CONSOLIDATEIMPACTED";
+        }
+        if (v.equals("entityonly") || v.equals("entity-only")) {
+            return "WEBOM_DATAGRID_TASK_CONSOLIDATEENTITY";
+        }
+        if (v.equals("force-entityonly") || v.equals("force_entityonly") || v.equals("forceentityonly")) {
+            return "WEBOM_DATAGRID_TASK_CONSOLIDATEFORCEENTITY";
+        }
+
+        // Otherwise, assume caller passed a raw enum name (case-insensitive).
+        for (WEBOMDATAGRIDTASKMASKENUM e : WEBOMDATAGRIDTASKMASKENUM.values()) {
+            if (e.name().equalsIgnoreCase(t)) return e.name();
+        }
+
+        // Last resort: return as-is; valueOf() will throw a clear error if wrong.
+        return t;
     }
 }
