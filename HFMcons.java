@@ -4,9 +4,15 @@
     Author: Henri Vilminko / Infratects
     Date: 2016-06-10
 
-    Sample command line using run.bat:
-    run.bat -u admin -p p4ssw0rd -a COMMA4DIM -c SANDBOX -s "S#Actual.Y#2007.P#June;July;August.E#EastRegion"
+    Notes:
+    - Updated by Minh's helper to add:
+      * taskInfo/taskIDs sanity print
+      * small delay before first poll (avoids Systeminfo race)
+      * guarded polling with limited retries for getCurrentTaskProgress
+      * clearer error if no task IDs were returned (likely bad POV)
 
+    Sample command line:
+    java project1.HFMcons -u admin -p p4ssw0rd -a COMMA4DIM -c SANDBOX -s "S#Actual.Y#2007.P#June;July;August.E#EastRegion"
 */
 
 package project1;
@@ -30,7 +36,6 @@ import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 
-
 public class HFMcons {
     public static void main(String[] args) {
 
@@ -44,12 +49,10 @@ public class HFMcons {
         SessionInfo session = null;
 
         try {
-
             // Parse the command line options
             Options opt = new Options();
 
-            opt.addOption("h", "help", false,
-                          "Print help for this application");
+            opt.addOption("h", "help", false, "Print help for this application");
             opt.addOption("u", "user", true, "Username for login");
             opt.addOption("p", "password", true, "Password for login");
             opt.addOption("a", "app", true, "HFM application name");
@@ -98,61 +101,95 @@ public class HFMcons {
             }
 
             System.out.println("Logging in to application " + appName + " with user " + username);
-            
+
             // Authenticate user to get a security token
-            ssoToken =
-                    HSSUtilManager.getSecurityManager().authenticateUser(username,
-                                                                         password);
+            ssoToken = HSSUtilManager.getSecurityManager().authenticateUser(username, password);
 
             // Create a session to work with an HFM application
             sessionOM = new SessionOM();
-            session =
-                    sessionOM.createSession(ssoToken, Locale.ENGLISH, hfmCluster,
-                                            appName);
+            session = sessionOM.createSession(ssoToken, Locale.ENGLISH, hfmCluster, appName);
 
             // Create a DataOM object for running data related tasks
             DataOM dataOM = new DataOM(session);
 
             System.out.println("Starting consolidation...");
-            
+
             // Consolidate the POV given on command line
             List<String> povs = new ArrayList<String>(1);
             povs.add(dataSlice);
-            ServerTaskInfo taskInfo =
-                dataOM.executeServerTask(WEBOMDATAGRIDTASKMASKENUM.valueOf("WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA"),
-                                         povs);
 
-            // Create an AdministrationOM object for checking task progress
+            ServerTaskInfo taskInfo = dataOM.executeServerTask(
+                WEBOMDATAGRIDTASKMASKENUM.valueOf("WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA"),
+                povs
+            );
+
+            // --- Robustness additions start ---
+            System.out.println("DEBUG: taskInfo=" + taskInfo);
+            System.out.println("DEBUG: taskIDs=" + (taskInfo == null ? "null" : taskInfo.getTaskIDs()));
+
+            if (taskInfo == null || taskInfo.getTaskIDs() == null || taskInfo.getTaskIDs().isEmpty()) {
+                System.err.println("ERROR: No task IDs returned. The POV may be invalid or not consolidatable: " + dataSlice);
+                // Close session before exit
+                if (sessionOM != null && session != null) sessionOM.closeSession(session);
+                System.exit(2);
+            }
+
+            // Small delay to avoid Systeminfo handler race on first poll
+            try { Thread.sleep(5000); } catch (InterruptedException ie) { /* ignore */ }
+
             AdministrationOM adminOM = new AdministrationOM(session);
 
-            // Wait for all started tasks to complete
+            // Guarded polling with a few retries if Systeminfo briefly fails
+            int pollAttempts = 0;
+            final int MAX_POLL_RETRIES = 3;
+
             Boolean tasksStillRunning = true;
             while (tasksStillRunning) {
 
-                // Update the task progress (returns a list of running tasks)
-                List<RunningTaskProgress> listProgress =
-                        adminOM.getCurrentTaskProgress(taskInfo.getTaskIDs());
+                List<RunningTaskProgress> listProgress = null;
 
-                // Iterate through the list of running tasks,
-                // checking status for each.
-                for (RunningTaskProgress taskProgress : listProgress) {
-
-                    System.out.println("Task #" + taskProgress.getTaskID() +
-                                       ": " + taskProgress.getDescription().replace("\r\n", " - ") +
-                                       ", " +
-                                       taskProgress.getPrecentCompleted() + "% done");
-
-                    // Keep waiting if any of the tasks are still in the running state
-                    USERACTIVITYSTATUS actStatus =
-                        taskProgress.getTaskStatus();
-                    if (actStatus.equals(USERACTIVITYSTATUS.valueOf("USERACTIVITYSTATUS_RUNNING"))) {
-                        tasksStillRunning = true;
-                        Thread.sleep(2000);
+                try {
+                    listProgress = adminOM.getCurrentTaskProgress(taskInfo.getTaskIDs());
+                    // reset attempts on success
+                    pollAttempts = 0;
+                } catch (Exception pollEx) {
+                    pollAttempts++;
+                    System.err.println("WARN: getCurrentTaskProgress failed (attempt " + pollAttempts + " of " + MAX_POLL_RETRIES + "): " + pollEx.getMessage());
+                    if (pollAttempts <= MAX_POLL_RETRIES) {
+                        try { Thread.sleep(3000); } catch (InterruptedException ie) { /* ignore */ }
+                        continue; // retry
                     } else {
-                        tasksStillRunning = false;
+                        throw pollEx; // give up with original error
                     }
                 }
+
+                // If server returned no progress entries, keep a short wait and continue one cycle
+                if (listProgress == null || listProgress.isEmpty()) {
+                    try { Thread.sleep(2000); } catch (InterruptedException ie) { /* ignore */ }
+                    continue;
+                }
+
+                // Iterate through the list of running tasks, checking status for each.
+                tasksStillRunning = false; // assume done unless we find RUNNING
+                for (RunningTaskProgress taskProgress : listProgress) {
+                    System.out.println(
+                        "Task #" + taskProgress.getTaskID() + ": " +
+                        taskProgress.getDescription().replace("\r\n", " - ") + ", " +
+                        taskProgress.getPrecentCompleted() + "% done"
+                    );
+
+                    USERACTIVITYSTATUS actStatus = taskProgress.getTaskStatus();
+                    if (USERACTIVITYSTATUS.valueOf("USERACTIVITYSTATUS_RUNNING").equals(actStatus)) {
+                        tasksStillRunning = true;
+                    }
+                }
+
+                if (tasksStillRunning) {
+                    try { Thread.sleep(2000); } catch (InterruptedException ie) { /* ignore */ }
+                }
             }
+            // --- Robustness additions end ---
+
             System.out.println("All tasks completed!");
 
             // All tasks done -> close the session gracefully
@@ -160,10 +197,8 @@ public class HFMcons {
                 sessionOM.closeSession(session);
             }
 
-		// Handle any exceptions thrown during the execution (just output the errors)
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
-
         }
     }
 }
