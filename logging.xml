@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<logging_configuration xmlns="http://xmlns.oracle.com/odl" version="1.0">
+  <handlers>
+    <handler name="file" class="oracle.core.ojdl.logging.ODLHandlerFactory">
+      <property name="path">H:\BMC\hfmcli\logs\HFMcons.log</property>
+      <property name="maxFileSize">10485760</property>
+      <property name="maxLogFiles">10</property>
+    </handler>
+  </handlers>
+  <loggers>
+    <logger name="oracle" level="INFO" useParentHandlers="false">
+      <handler name="file"/>
+    </logger>
+  </loggers>
+</logging_configuration>
