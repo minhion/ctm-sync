@@ -7,7 +7,6 @@ import java.util.regex.Pattern;
 
 import oracle.epm.fm.common.datatype.transport.SessionInfo;
 import oracle.epm.fm.common.datatype.transport.WEBOMDATAGRIDTASKMASKENUM;
-import oracle.epm.fm.common.datatype.transport.WEBOMDIMENSIONTYPE;
 import oracle.epm.fm.domainobject.application.SessionOM;
 import oracle.epm.fm.domainobject.metadata.MetadataOM;
 import oracle.epm.fm.hssservice.HSSUtilManager;
@@ -18,18 +17,15 @@ import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Options;
 
 /**
- * HFMpovInfo
+ * HFMpovInfo (reflection-safe)
  *
  * What it does:
- *  1) Logs in and prints Custom dimension count & labels (when available).
- *  2) Lists visible dimension enums & task enums (like your --list-types).
- *  3) Optional: --validate "<POV>" parses a POV like S#Actual.Y#2025.P#Aug;Sep.E#Entity.[Vw#YTD].[V#USD].C1#...
- *     and checks basic shape + whether the referenced Custom dimensions exist (C1..Ck).
+ *  1) Logs in and prints Custom dimension count & labels (via application profile, using reflection).
+ *  2) Lists task enums (like your --list-types) without needing to log in.
+ *  3) Optional: --validate "<POV>" parses S#/Y#/P#/E#/V#/Vw#/A#/I#/C1..C12, checks required tokens, and warns
+ *     if the POV references a custom index greater than what the app supports.
  *
- * Notes:
- *  - Labels come from the application profile via reflection (method names differ across 11.1.2.x).
- *    If reflection fails, we still detect the Custom count by probing C1..C12 using MetadataOM.
- *  - This does *not* execute any server task; it’s safe to run in production.
+ * NOTE: No compile-time dependency on WEBOMDIMENSIONTYPE (enum names differ across patch levels).
  */
 public class HFMpovInfo {
 
@@ -49,7 +45,6 @@ public class HFMpovInfo {
             opt.addOption("a", "app", true, "HFM application");
             opt.addOption("c", "cluster", true, "HFM cluster");
             opt.addOption(null, "validate", true, "Validate a POV string (e.g., \"S#Actual.Y#2025.P#Aug;Sep.E#CO_J00000.C1#Foo\")");
-            opt.addOption(null, "list-dims", false, "List available WEBOMDIMENSIONTYPE values and exit");
             opt.addOption(null, "list-types", false, "List available WEBOMDATAGRIDTASKMASKENUM values and exit");
 
             CommandLine cl = new BasicParser().parse(opt, args);
@@ -59,12 +54,7 @@ public class HFMpovInfo {
                 return;
             }
 
-            // quick local listings that require no login
-            if (cl.hasOption("list-dims")) {
-                System.out.println("WEBOMDIMENSIONTYPE values:");
-                for (WEBOMDIMENSIONTYPE e : WEBOMDIMENSIONTYPE.values()) System.out.println(" - " + e.name());
-                return;
-            }
+            // no-login helper
             if (cl.hasOption("list-types")) {
                 System.out.println("WEBOMDATAGRIDTASKMASKENUM values:");
                 for (WEBOMDATAGRIDTASKMASKENUM e : WEBOMDATAGRIDTASKMASKENUM.values()) System.out.println(" - " + e.name());
@@ -81,21 +71,21 @@ public class HFMpovInfo {
             System.out.println("Logging in to application " + appName + " with user " + username);
             String sso = HSSUtilManager.getSecurityManager().authenticateUser(username, password);
             sessionOM = new SessionOM();
-            session = sessionOM.createSession(sso, Locale.ENGLISH, cluster, appName);
+            session = sessionOM.createSession(sso, java.util.Locale.ENGLISH, cluster, appName);
 
-            // ---------- Metadata ----------
             MetadataOM md = new MetadataOM(session);
 
-            // Try to read application profile via reflection (method names differ by patch level)
+            // ---------- Application profile via reflection ----------
             Integer customCount = null;
             List<String> customLabels = null;
             try {
                 Object profile = tryCall(md, "getApplicationProfile");
                 if (profile == null) profile = tryCall(md, "getApplicationInfo");
+
                 if (profile != null) {
-                    customCount = (Integer) tryCall(profile, "getNumberOfCustomDimensions");
-                    if (customCount == null) customCount = (Integer) tryCall(profile, "getCustomDimensionCount");
-                    if (customCount == null) customCount = (Integer) tryCall(profile, "getCustomDimensionsCount");
+                    customCount = callInt(profile, "getNumberOfCustomDimensions");
+                    if (customCount == null) customCount = callInt(profile, "getCustomDimensionCount");
+                    if (customCount == null) customCount = callInt(profile, "getCustomDimensionsCount");
 
                     // labels if available
                     @SuppressWarnings("unchecked")
@@ -103,40 +93,33 @@ public class HFMpovInfo {
                     if (names == null && customCount != null) {
                         names = new ArrayList<String>();
                         for (int i = 1; i <= customCount; i++) {
-                            String n = (String) tryCall(profile, "getCustom" + i + "Name");
+                            String n = callString(profile, "getCustom" + i + "Name");
                             names.add(n != null ? n : "C" + i);
                         }
                     }
                     customLabels = names;
                 }
-            } catch (Throwable ignore) { /* fall back to probing */ }
-
-            // If profile route failed, probe C1..C12 existance
-            if (customCount == null) {
-                int max = 0;
-                for (int i = 1; i <= 12; i++) {
-                    try {
-                        WEBOMDIMENSIONTYPE dim = WEBOMDIMENSIONTYPE.valueOf("WEBOM_DIMENSION_CUSTOM" + i);
-                        // any metadata call that requires the dim to exist (lightweight)
-                        md.getMembers(dim, null, false);
-                        max = i;
-                    } catch (Throwable t) {
-                        break;
-                    }
-                }
-                customCount = max;
+            } catch (Throwable ignore) {
+                // If all profile methods are missing, we just won’t show labels.
             }
+
+            // If profile didn’t reveal a count, fall back to 0 (unknown) and just do POV shape checks.
+            if (customCount == null) customCount = 0;
 
             System.out.println();
             System.out.println("===== POV / Dimension Info =====");
-            System.out.println("Custom dimensions detected: " + customCount);
+            System.out.println("Custom dimensions detected (via profile): " + customCount);
             if (customLabels != null && !customLabels.isEmpty()) {
                 for (int i = 0; i < customLabels.size(); i++) {
                     System.out.println("  C" + (i+1) + " label: " + customLabels.get(i));
                 }
+            } else if (customCount > 0) {
+                for (int i = 1; i <= customCount; i++) System.out.println("  C" + i + " label: (not available via API)");
+            } else {
+                System.out.println("  (Profile did not expose custom labels/count on this patch level.)");
             }
 
-            // Optional: validate POV shape & custom range (cheap checks)
+            // ---------- Optional: validate POV ----------
             if (validatePov != null) {
                 System.out.println();
                 System.out.println("===== Validating POV =====");
@@ -144,24 +127,22 @@ public class HFMpovInfo {
 
                 PovTokens tokens = parsePov(validatePov);
 
-                // Required pieces
                 List<String> missing = new ArrayList<String>();
                 if (tokens.scenario == null) missing.add("S#<Scenario>");
                 if (tokens.year == null)     missing.add("Y#<Year>");
                 if (tokens.periods.isEmpty()) missing.add("P#<Period(s)>");
                 if (tokens.entity == null)   missing.add("E#<Entity>");
+
                 if (!missing.isEmpty()) {
                     System.out.println("ERROR: Missing required tokens: " + missing);
                 } else {
                     System.out.println("Required tokens present: S, Y, P, E");
                 }
 
-                // Custom range & order
                 int highestCustom = tokens.highestCustomIndex();
-                if (highestCustom > customCount) {
+                if (customCount > 0 && highestCustom > customCount) {
                     System.out.println("ERROR: POV references C" + highestCustom + " but application has only " + customCount + " custom dimensions.");
                 } else if (highestCustom > 0) {
-                    // ensure no gaps (e.g., C1 and C3 but no C2)
                     for (int i = 1; i <= highestCustom; i++) {
                         if (!tokens.customs.containsKey(i)) {
                             System.out.println("WARNING: POV skipped C" + i + " (gaps can cause invalid intersections).");
@@ -169,11 +150,9 @@ public class HFMpovInfo {
                     }
                 }
 
-                // Print what we parsed for quick eyeballing
                 tokens.prettyPrint();
             }
 
-            // Done
             if (sessionOM != null && session != null) sessionOM.closeSession(session);
 
         } catch (Exception e) {
@@ -183,16 +162,29 @@ public class HFMpovInfo {
         }
     }
 
-    // --------- helpers ----------
-
+    // ---------- reflection helpers ----------
     private static Object tryCall(Object target, String method) {
         try {
             Method m = target.getClass().getMethod(method);
             return m.invoke(target);
         } catch (Throwable t) { return null; }
     }
+    private static Integer callInt(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            return (v instanceof Integer) ? (Integer) v : null;
+        } catch (Throwable t) { return null; }
+    }
+    private static String callString(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            Object v = m.invoke(target);
+            return (v instanceof String) ? (String) v : null;
+        } catch (Throwable t) { return null; }
+    }
 
-    /** POV tokenization **/
+    // ---------- POV parser ----------
     private static final Pattern TOKEN =
         Pattern.compile("(?i)\\b(S|Y|P|E|V|Vw|A|I|C([1-9]|1[0-2]))#([^\\.]+)");
 
@@ -211,41 +203,4 @@ public class HFMpovInfo {
             if (scenario != null) System.out.println("  S# " + scenario);
             if (year != null)     System.out.println("  Y# " + year);
             if (!periods.isEmpty()) System.out.println("  P# " + String.join(";", periods));
-            if (entity != null)   System.out.println("  E# " + entity);
-            if (view != null)     System.out.println("  Vw# " + view);
-            if (value != null)    System.out.println("  V# " + value);
-            if (account != null)  System.out.println("  A# " + account);
-            if (icp != null)      System.out.println("  I# " + icp);
-            if (!customs.isEmpty()) {
-                List<Integer> keys = new ArrayList<Integer>(customs.keySet());
-                Collections.sort(keys);
-                for (int k : keys) System.out.println("  C" + k + "# " + customs.get(k));
-            }
-        }
-    }
-
-    private static PovTokens parsePov(String pov) {
-        PovTokens t = new PovTokens();
-        if (pov == null) return t;
-        Matcher m = TOKEN.matcher(pov);
-        while (m.find()) {
-            String tag = m.group(1);
-            String customIndexStr = m.group(2);
-            String member = m.group(3);
-
-            if ("S".equalsIgnoreCase(tag)) t.scenario = member;
-            else if ("Y".equalsIgnoreCase(tag)) t.year = member;
-            else if ("P".equalsIgnoreCase(tag)) t.periods = Arrays.asList(member.split(";"));
-            else if ("E".equalsIgnoreCase(tag)) t.entity = member;
-            else if ("Vw".equalsIgnoreCase(tag)) t.view = member;
-            else if ("V".equalsIgnoreCase(tag)) t.value = member;
-            else if ("A".equalsIgnoreCase(tag)) t.account = member;
-            else if ("I".equalsIgnoreCase(tag)) t.icp = member;
-            else if (customIndexStr != null) {
-                int idx = Integer.parseInt(customIndexStr);
-                t.customs.put(idx, member);
-            }
-        }
-        return t;
-    }
-}
+            if (entity != null)   Sys
