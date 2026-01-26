@@ -1,15 +1,14 @@
 /*
- * HfmCli.java - Unified HFM Command Line Interface for Control-M Integration
+ * HfmCli.java - HFM Command Line Interface for Control-M Integration
  * 
- * Author: Adapted from Henri Vilminko / Infratects examples
- * Purpose: Single entry point for all HFM operations callable from Control-M
+ * Compatible with Oracle EPM/HFM 11.1.2.0
+ * Uses Apache Commons CLI 1.2 syntax (bundled with Oracle EPM)
  * 
  * Supported Operations:
  *   - Consolidate
- *   - LoadData
  *   - Translate
- *   - ExtractDataToFlatfile
- *   - ExtractDataToDatabase
+ *   - LoadData
+ *   - ExtractData
  *   - ExtractMetadata
  *   - ExtractRules
  *   - ExtractMemberLists
@@ -18,9 +17,6 @@
  * 
  * Usage:
  *   java project1.HfmCli <operation> [options]
- * 
- * Example:
- *   java project1.HfmCli Consolidate -u admin -p password -a HCHFM -c HCHFMP -s "S#Actual.Y#2025..." -t AllWithData
  */
 
 package project1;
@@ -29,6 +25,7 @@ import java.io.File;
 import java.io.PrintStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -38,15 +35,22 @@ import oracle.epm.fm.domainobject.administration.AdministrationOM;
 import oracle.epm.fm.domainobject.application.SessionOM;
 import oracle.epm.fm.domainobject.data.DataOM;
 import oracle.epm.fm.domainobject.loadextract.LoadExtractOM;
-import oracle.epm.fm.domainobject.metadata.MetadataOM;
+import oracle.epm.fm.domainobject.loadextract.LoadExtractInfo;
 import oracle.epm.fm.hssservice.HSSUtilManager;
 
-import org.apache.commons.cli.*;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.GnuParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Option;
+import org.apache.commons.cli.OptionBuilder;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
 
 public class HfmCli {
 
     // ==================== Constants ====================
-    private static final String VERSION = "2.0.0";
+    private static final String VERSION = "2.2.0";
     private static final int DEFAULT_POLL_INTERVAL = 2000; // milliseconds
     
     // Exit codes for Control-M
@@ -145,6 +149,10 @@ public class HfmCli {
     private static boolean waitForTasks(HfmSession session, List<Integer> taskIds, 
             int pollInterval, boolean verbose) throws Exception {
         
+        if (taskIds == null || taskIds.isEmpty()) {
+            return true; // No tasks to wait for
+        }
+        
         AdministrationOM adminOM = new AdministrationOM(session.sessionInfo);
         boolean allCompleted = false;
         boolean anyFailed = false;
@@ -171,8 +179,6 @@ public class HfmCli {
                     allCompleted = false;
                 } else if (status == USERACTIVITYSTATUS.USERACTIVITYSTATUS_ABORTED ||
                            status == USERACTIVITYSTATUS.USERACTIVITYSTATUS_STOPPED) {
-                    // USERACTIVITYSTATUS_ABORTED = task failed/was aborted
-                    // USERACTIVITYSTATUS_STOPPED = task was stopped by user
                     anyFailed = true;
                 }
             }
@@ -185,10 +191,17 @@ public class HfmCli {
         return !anyFailed;
     }
     
-    // For ServerTaskInfo (consolidate/translate operations)
     private static boolean waitForServerTask(HfmSession session, ServerTaskInfo taskInfo,
             int pollInterval, boolean verbose) throws Exception {
         List<Integer> taskIds = taskInfo.getTaskIDs();
+        return waitForTasks(session, taskIds, pollInterval, verbose);
+    }
+    
+    // Wait for single task ID (used by extractData which returns int)
+    private static boolean waitForTask(HfmSession session, int taskId,
+            int pollInterval, boolean verbose) throws Exception {
+        List<Integer> taskIds = new ArrayList<Integer>();
+        taskIds.add(taskId);
         return waitForTasks(session, taskIds, pollInterval, verbose);
     }
 
@@ -197,20 +210,17 @@ public class HfmCli {
     private static WEBOMDATAGRIDTASKMASKENUM getConsolidationType(String type) {
         if (type == null) type = "AllWithData";
         
-        switch (type.toLowerCase().replace(" ", "").replace("_", "")) {
-            case "allwithdata":
-                return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA;
-            case "all":
-                return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATEALL;
-            case "impacted":
-                return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATE;
-            case "allwithdataforcecalculate":
-            case "allwithdata+force":
-                // Note: WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA_FORCECALCULATE doesn't exist in 11.1.2.0
-                // Use WEBOM_DATAGRID_TASK_FORCECALCULATE for force calculate operations
-                return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_FORCECALCULATE;
-            default:
-                return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA;
+        String normalized = type.toLowerCase().replace(" ", "").replace("_", "");
+        if (normalized.equals("allwithdata")) {
+            return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA;
+        } else if (normalized.equals("all")) {
+            return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATEALL;
+        } else if (normalized.equals("impacted")) {
+            return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATE;
+        } else if (normalized.equals("forcecalculate") || normalized.equals("force")) {
+            return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_FORCECALCULATE;
+        } else {
+            return WEBOMDATAGRIDTASKMASKENUM.WEBOM_DATAGRID_TASK_CONSOLIDATEALLWITHDATA;
         }
     }
 
@@ -240,7 +250,7 @@ public class HfmCli {
             
             // Execute consolidation
             DataOM dataOM = new DataOM(session.sessionInfo);
-            List<String> povList = new ArrayList<>();
+            List<String> povList = new ArrayList<String>();
             povList.add(pov);
             
             WEBOMDATAGRIDTASKMASKENUM consolidationType = getConsolidationType(type);
@@ -288,7 +298,6 @@ public class HfmCli {
             String delimiter = cl.getOptionValue("d", ";");
             String loadMode = cl.getOptionValue("loadMode", "Merge");
             boolean accumulate = Boolean.parseBoolean(cl.getOptionValue("accumulate", "false"));
-            boolean scanOnly = Boolean.parseBoolean(cl.getOptionValue("scanOnly", "false"));
             
             // Validate required parameters
             if (username == null || password == null || application == null || 
@@ -304,7 +313,6 @@ public class HfmCli {
             DataLoadOptions options = new DataLoadOptions();
             options.setDelimiter(delimiter);
             options.setAccumulateWithinFile(accumulate);
-            options.setUserFileName(dataFile);
             options.setAppendToLogFile(false);
             options.setContainSharesData(true);
             options.setContainSubmissionPhaseData(false);
@@ -313,30 +321,20 @@ public class HfmCli {
             options.loadCalculated = false;
             
             // Set load mode
-            switch (loadMode.toLowerCase()) {
-                case "merge":
-                    options.setDuplicates(DATALOAD_DUPLICATE_HANDLING.DATALOAD_MERGE);
-                    options.setMode(LOAD_MODE.LOAD);
-                    break;
-                case "replace":
-                    options.setDuplicates(DATALOAD_DUPLICATE_HANDLING.DATALOAD_REPLACE);
-                    options.setMode(LOAD_MODE.LOAD);
-                    break;
-                case "accumulate":
-                    options.setDuplicates(DATALOAD_DUPLICATE_HANDLING.DATALOAD_ACCUMULATE);
-                    options.setMode(LOAD_MODE.LOAD);
-                    break;
-                default:
-                    options.setDuplicates(DATALOAD_DUPLICATE_HANDLING.DATALOAD_MERGE);
-                    options.setMode(LOAD_MODE.LOAD);
+            if ("replace".equalsIgnoreCase(loadMode)) {
+                options.setDuplicates(DATALOAD_DUPLICATE_HANDLING.DATALOAD_REPLACE);
+            } else if ("accumulate".equalsIgnoreCase(loadMode)) {
+                options.setDuplicates(DATALOAD_DUPLICATE_HANDLING.DATALOAD_ACCUMULATE);
+            } else {
+                options.setDuplicates(DATALOAD_DUPLICATE_HANDLING.DATALOAD_MERGE);
             }
-            
+            options.setMode(LOAD_MODE.LOAD);
             options.setFileFormat(DATALOAD_FILE_FORMAT.DATALOAD_FILE_FORMAT_NATIVE);
             
-            List<DataLoadOptions> optsList = new ArrayList<>();
+            List<DataLoadOptions> optsList = new ArrayList<DataLoadOptions>();
             optsList.add(options);
             
-            List<String> files = new ArrayList<>();
+            List<String> files = new ArrayList<String>();
             files.add(new File(dataFile).getPath());
             
             // Execute load
@@ -395,7 +393,7 @@ public class HfmCli {
             
             // Execute translation
             DataOM dataOM = new DataOM(session.sessionInfo);
-            List<String> povList = new ArrayList<>();
+            List<String> povList = new ArrayList<String>();
             povList.add(pov);
             
             WEBOMDATAGRIDTASKMASKENUM translateType = force ? 
@@ -431,9 +429,9 @@ public class HfmCli {
         }
     }
 
-    // ==================== Operation: Extract Data to Flatfile ====================
+    // ==================== Operation: Extract Data ====================
     
-    private static int doExtractDataToFlatfile(CommandLine cl, int pollInterval, boolean verbose) {
+    private static int doExtractData(CommandLine cl, int pollInterval, boolean verbose) {
         long startTime = System.currentTimeMillis();
         String application = cl.getOptionValue("a");
         HfmSession session = null;
@@ -443,19 +441,20 @@ public class HfmCli {
             String password = cl.getOptionValue("p");
             String cluster = cl.getOptionValue("c");
             String pov = cl.getOptionValue("s");
-            String dataFile = cl.getOptionValue("f");
             String delimiter = cl.getOptionValue("d", ";");
-            String extractFormat = cl.getOptionValue("extractFormat", "Flatfile - without header");
-            String lineItemOption = cl.getOptionValue("lineItemOption", "None");
+            String extractFormat = cl.getOptionValue("extractFormat", "flatfile");
             boolean calculatedData = Boolean.parseBoolean(cl.getOptionValue("calculatedData", "false"));
             boolean derivedData = Boolean.parseBoolean(cl.getOptionValue("derivedData", "false"));
             boolean dynamicAccounts = Boolean.parseBoolean(cl.getOptionValue("dynamicAccounts", "false"));
             
+            // Database options
+            String dsn = cl.getOptionValue("dsn");
+            String prefix = cl.getOptionValue("prefix", "HFM_");
+            
             // Validate required parameters
             if (username == null || password == null || application == null || 
-                cluster == null || pov == null || dataFile == null) {
-                jsonError("Missing required parameters: -u, -p, -a, -c, -s, -f", 
-                        "ExtractDataToFlatfile", application);
+                cluster == null || pov == null) {
+                jsonError("Missing required parameters: -u, -p, -a, -c, -s", "ExtractData", application);
                 return EXIT_INVALID_ARGS;
             }
             
@@ -465,118 +464,55 @@ public class HfmCli {
             // Build extract options
             DataExtractOptions options = new DataExtractOptions();
             options.setDelimiter(delimiter);
+            options.setMetadataSlice(pov);  // POV goes in metadataSlice
             options.setIncludeCalculatedData(calculatedData);
             options.setIncludeDerivedData(derivedData);
             options.setIncludeDynamicAccounts(dynamicAccounts);
-            // Note: File path is typically passed to extractData method, not options
+            options.setIncludeData(true);
             
-            // Set extract format using DATA_EXTRACT_TYPE_FLAG enum
-            if (extractFormat.toLowerCase().contains("without header")) {
-                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.DATA_EXTRACT_TYPE_FLAG_FLATFILE_NOHEADER);
-            } else if (extractFormat.toLowerCase().contains("with header")) {
-                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.DATA_EXTRACT_TYPE_FLAG_FLATFILE_HEADER);
+            // Set extract format based on type
+            String fmt = extractFormat.toLowerCase().replace(" ", "").replace("_", "");
+            if (fmt.contains("noheader") || fmt.contains("flatfilenoheader")) {
+                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.EA_EXTRACT_TYPE_FLATFILE_NOHEADER);
+            } else if (fmt.contains("flatfile") || fmt.contains("standard")) {
+                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.EA_EXTRACT_TYPE_FLATFILE);
+            } else if (fmt.contains("warehouse") || fmt.contains("database")) {
+                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.EA_EXTRACT_TYPE_WAREHOUSE);
+                if (dsn != null) {
+                    options.setDSN(dsn);
+                    options.setTablePrefix(prefix);
+                }
+            } else if (fmt.contains("essbase")) {
+                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.EA_EXTRACT_TYPE_ESSBASE);
             } else {
-                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.DATA_EXTRACT_TYPE_FLAG_NATIVE);
+                options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.EA_EXTRACT_TYPE_FLATFILE);
             }
             
-            List<String> povList = new ArrayList<>();
-            povList.add(pov);
-            
-            // Execute extract
+            // Execute extract - returns single int task ID
             LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
-            List<Integer> taskIds = extractOM.extractData(povList, options);
+            int taskId = extractOM.extractData(options);
             
             // Wait for completion
-            boolean success = waitForTasks(session, taskIds, pollInterval, verbose);
+            List<Integer> taskIds = new ArrayList<Integer>();
+            taskIds.add(taskId);
+            boolean success = waitForTask(session, taskId, pollInterval, verbose);
             
             long elapsed = System.currentTimeMillis() - startTime;
             
             if (success) {
-                jsonSuccess("Data extract completed successfully", "ExtractDataToFlatfile", 
+                jsonSuccess("Data extract completed successfully", "ExtractData", 
                         application, elapsed, taskIds);
                 return EXIT_SUCCESS;
             } else {
                 jsonOutput(System.out, "Failed", "Data extract task failed", 
-                        "ExtractDataToFlatfile", application, elapsed, taskIds);
+                        "ExtractData", application, elapsed, taskIds);
                 return EXIT_TASK_FAILED;
             }
             
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - startTime;
             jsonOutput(System.out, "Error", e.getClass().getSimpleName() + ": " + e.getMessage(),
-                    "ExtractDataToFlatfile", application, elapsed, null);
-            if (verbose) e.printStackTrace(System.err);
-            return EXIT_OPERATION_FAILED;
-        } finally {
-            if (session != null) session.close();
-        }
-    }
-
-    // ==================== Operation: Extract Data to Database ====================
-    
-    private static int doExtractDataToDatabase(CommandLine cl, int pollInterval, boolean verbose) {
-        long startTime = System.currentTimeMillis();
-        String application = cl.getOptionValue("a");
-        HfmSession session = null;
-        
-        try {
-            String username = cl.getOptionValue("u");
-            String password = cl.getOptionValue("p");
-            String cluster = cl.getOptionValue("c");
-            String pov = cl.getOptionValue("s");
-            String dsn = cl.getOptionValue("dsn");
-            String prefix = cl.getOptionValue("prefix", "HFM");
-            String schemaAction = cl.getOptionValue("schemaAction", "Create Star Schema");
-            boolean calculatedData = Boolean.parseBoolean(cl.getOptionValue("calculatedData", "false"));
-            boolean derivedData = Boolean.parseBoolean(cl.getOptionValue("derivedData", "false"));
-            
-            // Validate required parameters
-            if (username == null || password == null || application == null || 
-                cluster == null || pov == null || dsn == null) {
-                jsonError("Missing required parameters: -u, -p, -a, -c, -s, --dsn", 
-                        "ExtractDataToDatabase", application);
-                return EXIT_INVALID_ARGS;
-            }
-            
-            // Create session
-            session = createSession(username, password, cluster, application);
-            
-            // Build extract options for database
-            DataExtractOptions options = new DataExtractOptions();
-            options.setIncludeCalculatedData(calculatedData);
-            options.setIncludeDerivedData(derivedData);
-            options.setDSN(dsn);
-            options.setTablePrefix(prefix);
-            
-            // Set extract format for database
-            options.setExtractFormat(DATA_EXTRACT_TYPE_FLAG.DATA_EXTRACT_TYPE_FLAG_DATABASE);
-            
-            List<String> povList = new ArrayList<>();
-            povList.add(pov);
-            
-            // Execute extract
-            LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
-            List<Integer> taskIds = extractOM.extractData(povList, options);
-            
-            // Wait for completion
-            boolean success = waitForTasks(session, taskIds, pollInterval, verbose);
-            
-            long elapsed = System.currentTimeMillis() - startTime;
-            
-            if (success) {
-                jsonSuccess("Database extract completed successfully", "ExtractDataToDatabase", 
-                        application, elapsed, taskIds);
-                return EXIT_SUCCESS;
-            } else {
-                jsonOutput(System.out, "Failed", "Database extract task failed", 
-                        "ExtractDataToDatabase", application, elapsed, taskIds);
-                return EXIT_TASK_FAILED;
-            }
-            
-        } catch (Exception e) {
-            long elapsed = System.currentTimeMillis() - startTime;
-            jsonOutput(System.out, "Error", e.getClass().getSimpleName() + ": " + e.getMessage(),
-                    "ExtractDataToDatabase", application, elapsed, null);
+                    "ExtractData", application, elapsed, null);
             if (verbose) e.printStackTrace(System.err);
             return EXIT_OPERATION_FAILED;
         } finally {
@@ -595,84 +531,64 @@ public class HfmCli {
             String username = cl.getOptionValue("u");
             String password = cl.getOptionValue("p");
             String cluster = cl.getOptionValue("c");
-            String dataFile = cl.getOptionValue("f");
             String delimiter = cl.getOptionValue("d", ";");
             String fileFormat = cl.getOptionValue("fileFormat", "app");
             
-            // Metadata selection options
-            boolean accounts = Boolean.parseBoolean(cl.getOptionValue("accounts", "false"));
-            boolean entities = Boolean.parseBoolean(cl.getOptionValue("entities", "false"));
-            boolean scenarios = Boolean.parseBoolean(cl.getOptionValue("scenarios", "false"));
-            boolean icps = Boolean.parseBoolean(cl.getOptionValue("ICPs", "false"));
-            boolean currencies = Boolean.parseBoolean(cl.getOptionValue("currencies", "false"));
-            boolean values = Boolean.parseBoolean(cl.getOptionValue("values", "false"));
-            boolean appSettings = Boolean.parseBoolean(cl.getOptionValue("applicationSettings", "false"));
-            boolean consolidationMethods = Boolean.parseBoolean(cl.getOptionValue("consolidationMethods", "false"));
-            boolean cellTextLabels = Boolean.parseBoolean(cl.getOptionValue("cellTextLabels", "false"));
+            // Metadata options - default all to true
+            boolean accounts = Boolean.parseBoolean(cl.getOptionValue("accounts", "true"));
+            boolean entities = Boolean.parseBoolean(cl.getOptionValue("entities", "true"));
+            boolean scenarios = Boolean.parseBoolean(cl.getOptionValue("scenarios", "true"));
+            boolean currencies = Boolean.parseBoolean(cl.getOptionValue("currencies", "true"));
+            boolean values = Boolean.parseBoolean(cl.getOptionValue("values", "true"));
+            boolean icps = Boolean.parseBoolean(cl.getOptionValue("ICPs", "true"));
+            boolean appSettings = Boolean.parseBoolean(cl.getOptionValue("appSettings", "true"));
+            boolean consolMethods = Boolean.parseBoolean(cl.getOptionValue("consolMethods", "true"));
+            boolean cellTxtLabels = Boolean.parseBoolean(cl.getOptionValue("cellTxtLabels", "true"));
             boolean systemAccounts = Boolean.parseBoolean(cl.getOptionValue("systemAccounts", "false"));
-            String customDimensions = cl.getOptionValue("customDimensions", "");
             
             // Validate required parameters
-            if (username == null || password == null || application == null || 
-                cluster == null || dataFile == null) {
-                jsonError("Missing required parameters: -u, -p, -a, -c, -f", 
-                        "ExtractMetadata", application);
+            if (username == null || password == null || application == null || cluster == null) {
+                jsonError("Missing required parameters: -u, -p, -a, -c", "ExtractMetadata", application);
                 return EXIT_INVALID_ARGS;
             }
             
             // Create session
             session = createSession(username, password, cluster, application);
             
-            // Build metadata extract options
+            // Build extract options
             MetadataExtractOptions options = new MetadataExtractOptions();
             options.setDelimiter(delimiter);
-            options.setUserFileName(dataFile);
             options.setAccounts(accounts);
             options.setEntities(entities);
             options.setScenarios(scenarios);
-            options.setICPs(icps);
             options.setCurrencies(currencies);
             options.setValues(values);
-            options.setApplicationSettings(appSettings);
-            options.setConsolidationMethods(consolidationMethods);
-            options.setCellTextLabels(cellTextLabels);
+            options.setICPs(icps);
+            options.setAppSettings(appSettings);
+            options.setConsolMethods(consolMethods);
+            options.setCellTxtLabels(cellTxtLabels);
             options.setSystemAccounts(systemAccounts);
-            
-            // Custom dimensions
-            if (customDimensions != null && !customDimensions.isEmpty()) {
-                String[] dims = customDimensions.split("[;,]");
-                for (String dim : dims) {
-                    if (!dim.trim().isEmpty()) {
-                        options.addCustomDimension(dim.trim());
-                    }
-                }
-            }
+            options.setYears(true);
+            options.setPeriods(true);
+            options.setViews(true);
             
             // Set file format
-            if (fileFormat.equalsIgnoreCase("xml")) {
-                options.setFileFormat(METADATA_FILE_FORMAT.METADATA_FILE_FORMAT_XML);
+            if ("xml".equalsIgnoreCase(fileFormat)) {
+                options.setFileFormat(METADATA_FILE_FORMAT_ENUM.METADATA_FILE_FORMAT_ENUM_XML);
             } else {
-                options.setFileFormat(METADATA_FILE_FORMAT.METADATA_FILE_FORMAT_APP);
+                options.setFileFormat(METADATA_FILE_FORMAT_ENUM.METADATA_FILE_FORMAT_ENUM_APP);
             }
             
-            // Execute extract
+            // Execute extract - returns LoadExtractInfo
             LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
-            List<Integer> taskIds = extractOM.extractMetadata(options);
-            
-            // Wait for completion
-            boolean success = waitForTasks(session, taskIds, pollInterval, verbose);
+            LoadExtractInfo info = extractOM.extractMetadata(options);
             
             long elapsed = System.currentTimeMillis() - startTime;
             
-            if (success) {
-                jsonSuccess("Metadata extract completed successfully", "ExtractMetadata", 
-                        application, elapsed, taskIds);
-                return EXIT_SUCCESS;
-            } else {
-                jsonOutput(System.out, "Failed", "Metadata extract task failed", 
-                        "ExtractMetadata", application, elapsed, taskIds);
-                return EXIT_TASK_FAILED;
-            }
+            // LoadExtractInfo contains status - check if successful
+            String statusMsg = info != null ? "Metadata extract completed" : "Metadata extract returned null";
+            jsonSuccess(statusMsg, "ExtractMetadata", application, elapsed, null);
+            return EXIT_SUCCESS;
             
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - startTime;
@@ -696,37 +612,34 @@ public class HfmCli {
             String username = cl.getOptionValue("u");
             String password = cl.getOptionValue("p");
             String cluster = cl.getOptionValue("c");
-            String dataFile = cl.getOptionValue("f");
+            String fileFormat = cl.getOptionValue("fileFormat", "xml");
             
             // Validate required parameters
-            if (username == null || password == null || application == null || 
-                cluster == null || dataFile == null) {
-                jsonError("Missing required parameters: -u, -p, -a, -c, -f", 
-                        "ExtractRules", application);
+            if (username == null || password == null || application == null || cluster == null) {
+                jsonError("Missing required parameters: -u, -p, -a, -c", "ExtractRules", application);
                 return EXIT_INVALID_ARGS;
             }
             
             // Create session
             session = createSession(username, password, cluster, application);
             
-            // Execute extract
-            LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
-            List<Integer> taskIds = extractOM.extractRules(dataFile);
+            // Determine file format enum
+            RULESEXTRACT_FILE_FORMAT format;
+            if ("rle".equalsIgnoreCase(fileFormat)) {
+                format = RULESEXTRACT_FILE_FORMAT.RULESEXTRACT_FILE_FORMAT_RLE;
+            } else {
+                format = RULESEXTRACT_FILE_FORMAT.RULESEXTRACT_FILE_FORMAT_XML;
+            }
             
-            // Wait for completion
-            boolean success = waitForTasks(session, taskIds, pollInterval, verbose);
+            // Execute extract - returns LoadExtractInfo
+            LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
+            LoadExtractInfo info = extractOM.extractRules(format);
             
             long elapsed = System.currentTimeMillis() - startTime;
             
-            if (success) {
-                jsonSuccess("Rules extract completed successfully", "ExtractRules", 
-                        application, elapsed, taskIds);
-                return EXIT_SUCCESS;
-            } else {
-                jsonOutput(System.out, "Failed", "Rules extract task failed", 
-                        "ExtractRules", application, elapsed, taskIds);
-                return EXIT_TASK_FAILED;
-            }
+            String statusMsg = info != null ? "Rules extract completed" : "Rules extract returned null";
+            jsonSuccess(statusMsg, "ExtractRules", application, elapsed, null);
+            return EXIT_SUCCESS;
             
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - startTime;
@@ -750,37 +663,25 @@ public class HfmCli {
             String username = cl.getOptionValue("u");
             String password = cl.getOptionValue("p");
             String cluster = cl.getOptionValue("c");
-            String dataFile = cl.getOptionValue("f");
             
             // Validate required parameters
-            if (username == null || password == null || application == null || 
-                cluster == null || dataFile == null) {
-                jsonError("Missing required parameters: -u, -p, -a, -c, -f", 
-                        "ExtractMemberLists", application);
+            if (username == null || password == null || application == null || cluster == null) {
+                jsonError("Missing required parameters: -u, -p, -a, -c", "ExtractMemberLists", application);
                 return EXIT_INVALID_ARGS;
             }
             
             // Create session
             session = createSession(username, password, cluster, application);
             
-            // Execute extract
+            // Execute extract - takes no arguments, returns LoadExtractInfo
             LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
-            List<Integer> taskIds = extractOM.extractMemberLists(dataFile);
-            
-            // Wait for completion
-            boolean success = waitForTasks(session, taskIds, pollInterval, verbose);
+            LoadExtractInfo info = extractOM.extractMemberLists();
             
             long elapsed = System.currentTimeMillis() - startTime;
             
-            if (success) {
-                jsonSuccess("Member lists extract completed successfully", "ExtractMemberLists", 
-                        application, elapsed, taskIds);
-                return EXIT_SUCCESS;
-            } else {
-                jsonOutput(System.out, "Failed", "Member lists extract task failed", 
-                        "ExtractMemberLists", application, elapsed, taskIds);
-                return EXIT_TASK_FAILED;
-            }
+            String statusMsg = info != null ? "Member lists extract completed" : "Member lists extract returned null";
+            jsonSuccess(statusMsg, "ExtractMemberLists", application, elapsed, null);
+            return EXIT_SUCCESS;
             
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - startTime;
@@ -804,52 +705,41 @@ public class HfmCli {
             String username = cl.getOptionValue("u");
             String password = cl.getOptionValue("p");
             String cluster = cl.getOptionValue("c");
-            String dataFile = cl.getOptionValue("f");
             String delimiter = cl.getOptionValue("d", ";");
             
+            // Security options
+            boolean users = Boolean.parseBoolean(cl.getOptionValue("users", "true"));
             boolean securityClasses = Boolean.parseBoolean(cl.getOptionValue("securityClasses", "true"));
             boolean roleAccess = Boolean.parseBoolean(cl.getOptionValue("roleAccess", "true"));
             boolean securityClassAccess = Boolean.parseBoolean(cl.getOptionValue("securityClassAccess", "true"));
-            boolean loadUsers = Boolean.parseBoolean(cl.getOptionValue("loadUsers", "true"));
             
             // Validate required parameters
-            if (username == null || password == null || application == null || 
-                cluster == null || dataFile == null) {
-                jsonError("Missing required parameters: -u, -p, -a, -c, -f", 
-                        "ExtractSecurity", application);
+            if (username == null || password == null || application == null || cluster == null) {
+                jsonError("Missing required parameters: -u, -p, -a, -c", "ExtractSecurity", application);
                 return EXIT_INVALID_ARGS;
             }
             
             // Create session
             session = createSession(username, password, cluster, application);
             
-            // Build security extract options
+            // Build extract options
             SecurityExtractOptions options = new SecurityExtractOptions();
             options.setDelimiter(delimiter);
-            options.setUserFileName(dataFile);
+            options.setUsers(users);
             options.setSecurityClasses(securityClasses);
             options.setRoleAccess(roleAccess);
             options.setSecurityClassAccess(securityClassAccess);
-            options.setUsers(loadUsers);
+            options.setFileFormat(SECURITYEXTRACT_FILEFORMAT.SECURITYEXTRACT_FILEFORMAT_NATIVE);
             
-            // Execute extract
+            // Execute extract - returns LoadExtractInfo
             LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
-            List<Integer> taskIds = extractOM.extractSecurity(options);
-            
-            // Wait for completion
-            boolean success = waitForTasks(session, taskIds, pollInterval, verbose);
+            LoadExtractInfo info = extractOM.extractSecurity(options);
             
             long elapsed = System.currentTimeMillis() - startTime;
             
-            if (success) {
-                jsonSuccess("Security extract completed successfully", "ExtractSecurity", 
-                        application, elapsed, taskIds);
-                return EXIT_SUCCESS;
-            } else {
-                jsonOutput(System.out, "Failed", "Security extract task failed", 
-                        "ExtractSecurity", application, elapsed, taskIds);
-                return EXIT_TASK_FAILED;
-            }
+            String statusMsg = info != null ? "Security extract completed" : "Security extract returned null";
+            jsonSuccess(statusMsg, "ExtractSecurity", application, elapsed, null);
+            return EXIT_SUCCESS;
             
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - startTime;
@@ -874,85 +764,54 @@ public class HfmCli {
             String password = cl.getOptionValue("p");
             String cluster = cl.getOptionValue("c");
             String pov = cl.getOptionValue("s");
-            String dataFile = cl.getOptionValue("f");
             String delimiter = cl.getOptionValue("d", ";");
             
-            // Journal status options
-            boolean extractJournals = Boolean.parseBoolean(cl.getOptionValue("extractJournals", "true"));
-            boolean extractTemplates = Boolean.parseBoolean(cl.getOptionValue("extractTemplates", "true"));
-            boolean posted = Boolean.parseBoolean(cl.getOptionValue("posted", "true"));
-            boolean approved = Boolean.parseBoolean(cl.getOptionValue("approved", "true"));
-            boolean submitted = Boolean.parseBoolean(cl.getOptionValue("submitted", "true"));
-            boolean rejected = Boolean.parseBoolean(cl.getOptionValue("rejected", "true"));
-            boolean working = Boolean.parseBoolean(cl.getOptionValue("working", "true"));
+            // Journal options
             boolean regular = Boolean.parseBoolean(cl.getOptionValue("regular", "true"));
-            boolean autoreversing = Boolean.parseBoolean(cl.getOptionValue("autoreversing", "true"));
-            boolean autoreversal = Boolean.parseBoolean(cl.getOptionValue("autoreversal", "true"));
-            boolean recurringTemplates = Boolean.parseBoolean(cl.getOptionValue("recurringTemplates", "true"));
-            boolean balanced = Boolean.parseBoolean(cl.getOptionValue("balanced", "true"));
-            boolean unbalanced = Boolean.parseBoolean(cl.getOptionValue("unbalanced", "true"));
-            boolean balancedByEntity = Boolean.parseBoolean(cl.getOptionValue("balancedByEntity", "true"));
-            String labels = cl.getOptionValue("labels", "");
-            String groups = cl.getOptionValue("groups", "");
+            boolean standard = Boolean.parseBoolean(cl.getOptionValue("standard", "true"));
+            boolean recurring = Boolean.parseBoolean(cl.getOptionValue("recurring", "false"));
+            String labelsStr = cl.getOptionValue("labels");
+            String groupsStr = cl.getOptionValue("groups");
             
             // Validate required parameters
             if (username == null || password == null || application == null || 
-                cluster == null || pov == null || dataFile == null) {
-                jsonError("Missing required parameters: -u, -p, -a, -c, -s, -f", 
-                        "ExtractJournals", application);
+                cluster == null || pov == null) {
+                jsonError("Missing required parameters: -u, -p, -a, -c, -s", "ExtractJournals", application);
                 return EXIT_INVALID_ARGS;
             }
             
             // Create session
             session = createSession(username, password, cluster, application);
             
-            // Build journal extract options
+            // Build extract options
             JournalExtractOptions options = new JournalExtractOptions();
             options.setDelimiter(delimiter);
-            options.setUserFileName(dataFile);
-            options.setExtractJournals(extractJournals);
-            options.setExtractTemplates(extractTemplates);
-            options.setPosted(posted);
-            options.setApproved(approved);
-            options.setSubmitted(submitted);
-            options.setRejected(rejected);
-            options.setWorking(working);
+            options.setPov(pov);
             options.setRegular(regular);
-            options.setAutoreversing(autoreversing);
-            options.setAutoreversal(autoreversal);
-            options.setRecurringTemplates(recurringTemplates);
-            options.setBalanced(balanced);
-            options.setUnbalanced(unbalanced);
-            options.setBalancedByEntity(balancedByEntity);
+            options.setStandard(standard);
+            options.setRecurring(recurring);
             
-            if (labels != null && !labels.isEmpty()) {
+            // Set labels if provided
+            if (labelsStr != null && !labelsStr.isEmpty()) {
+                List<String> labels = Arrays.asList(labelsStr.split("[;,]"));
                 options.setLabels(labels);
             }
-            if (groups != null && !groups.isEmpty()) {
+            
+            // Set groups if provided
+            if (groupsStr != null && !groupsStr.isEmpty()) {
+                List<String> groups = Arrays.asList(groupsStr.split("[;,]"));
                 options.setGroups(groups);
             }
             
-            List<String> povList = new ArrayList<>();
-            povList.add(pov);
-            
-            // Execute extract
+            // Execute extract - returns LoadExtractInfo
             LoadExtractOM extractOM = new LoadExtractOM(session.sessionInfo);
-            List<Integer> taskIds = extractOM.extractJournals(povList, options);
-            
-            // Wait for completion
-            boolean success = waitForTasks(session, taskIds, pollInterval, verbose);
+            LoadExtractInfo info = extractOM.extractJournals(options);
             
             long elapsed = System.currentTimeMillis() - startTime;
             
-            if (success) {
-                jsonSuccess("Journals extract completed successfully", "ExtractJournals", 
-                        application, elapsed, taskIds);
-                return EXIT_SUCCESS;
-            } else {
-                jsonOutput(System.out, "Failed", "Journals extract task failed", 
-                        "ExtractJournals", application, elapsed, taskIds);
-                return EXIT_TASK_FAILED;
-            }
+            String statusMsg = info != null ? "Journals extract completed" : "Journals extract returned null";
+            jsonSuccess(statusMsg, "ExtractJournals", application, elapsed, null);
+            return EXIT_SUCCESS;
             
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - startTime;
@@ -965,136 +824,157 @@ public class HfmCli {
         }
     }
 
-    // ==================== CLI Options Builder ====================
+    // ==================== Command Line Options ====================
     
+    @SuppressWarnings("static-access")
     private static Options buildOptions() {
         Options options = new Options();
         
-        // Common options
-        options.addOption("h", "help", false, "Show help message");
-        options.addOption("v", "verbose", false, "Enable verbose output with progress updates");
-        options.addOption("V", "version", false, "Show version information");
-        
-        // Authentication
-        options.addOption("u", "user", true, "Username for HFM authentication");
-        options.addOption("p", "password", true, "Password for HFM authentication");
-        
-        // Connection
-        options.addOption("a", "app", true, "HFM application name");
-        options.addOption("c", "cluster", true, "HFM cluster name");
-        
-        // Common parameters
-        options.addOption("s", "pov", true, "Point of View (POV) string");
-        options.addOption("f", "file", true, "Data file path");
-        options.addOption("d", "delimiter", true, "File delimiter (default: ;)");
-        options.addOption("t", "type", true, "Consolidation type: AllWithData, All, Impacted");
-        
-        // Polling
-        options.addOption(Option.builder()
-                .longOpt("pollInterval")
+        // Common options using Commons CLI 1.2 OptionBuilder syntax
+        options.addOption(OptionBuilder
+                .withLongOpt("user")
+                .withDescription("HFM username")
                 .hasArg()
-                .desc("Task polling interval in milliseconds (default: 2000)")
-                .build());
+                .withArgName("USERNAME")
+                .create("u"));
         
-        // Load Data options
-        options.addOption(Option.builder().longOpt("loadMode").hasArg()
-                .desc("Load mode: Merge, Replace, Accumulate").build());
-        options.addOption(Option.builder().longOpt("accumulate").hasArg()
-                .desc("Accumulate within file: true/false").build());
-        options.addOption(Option.builder().longOpt("scanOnly").hasArg()
-                .desc("Scan only mode: true/false").build());
+        options.addOption(OptionBuilder
+                .withLongOpt("password")
+                .withDescription("HFM password")
+                .hasArg()
+                .withArgName("PASSWORD")
+                .create("p"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("app")
+                .withDescription("HFM application name")
+                .hasArg()
+                .withArgName("APP")
+                .create("a"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("cluster")
+                .withDescription("HFM cluster name")
+                .hasArg()
+                .withArgName("CLUSTER")
+                .create("c"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("slice")
+                .withDescription("POV slice string")
+                .hasArg()
+                .withArgName("POV")
+                .create("s"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("type")
+                .withDescription("Consolidation type: AllWithData, All, Impacted, ForceCalculate")
+                .hasArg()
+                .withArgName("TYPE")
+                .create("t"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("file")
+                .withDescription("Data file path")
+                .hasArg()
+                .withArgName("FILE")
+                .create("f"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("delimiter")
+                .withDescription("Field delimiter (default: ;)")
+                .hasArg()
+                .withArgName("DELIM")
+                .create("d"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("verbose")
+                .withDescription("Enable verbose output")
+                .create("v"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("help")
+                .withDescription("Show help")
+                .create("h"));
+        
+        options.addOption(OptionBuilder
+                .withLongOpt("version")
+                .withDescription("Show version")
+                .create("V"));
+        
+        // Load options
+        options.addOption(OptionBuilder.withLongOpt("loadMode")
+                .hasArg().withDescription("Load mode: Merge, Replace, Accumulate").create());
+        options.addOption(OptionBuilder.withLongOpt("accumulate")
+                .hasArg().withDescription("Accumulate within file: true/false").create());
         
         // Translate options
-        options.addOption(Option.builder().longOpt("force").hasArg()
-                .desc("Force translation: true/false").build());
+        options.addOption(OptionBuilder.withLongOpt("force")
+                .hasArg().withDescription("Force translate: true/false").create());
         
-        // Extract Data options
-        options.addOption(Option.builder().longOpt("extractFormat").hasArg()
-                .desc("Extract format: 'Flatfile - without header', 'Flatfile - with header'").build());
-        options.addOption(Option.builder().longOpt("lineItemOption").hasArg()
-                .desc("Line item option: None, Description, Both").build());
-        options.addOption(Option.builder().longOpt("calculatedData").hasArg()
-                .desc("Include calculated data: true/false").build());
-        options.addOption(Option.builder().longOpt("derivedData").hasArg()
-                .desc("Include derived data: true/false").build());
-        options.addOption(Option.builder().longOpt("dynamicAccounts").hasArg()
-                .desc("Include dynamic accounts: true/false").build());
-        options.addOption(Option.builder().longOpt("prefix").hasArg()
-                .desc("Table prefix for database extract").build());
-        options.addOption(Option.builder().longOpt("dsn").hasArg()
-                .desc("DSN for database extract").build());
-        options.addOption(Option.builder().longOpt("schemaAction").hasArg()
-                .desc("Schema action: 'Create Star Schema'").build());
+        // Extract data options
+        options.addOption(OptionBuilder.withLongOpt("extractFormat")
+                .hasArg().withDescription("Extract format: flatfile, flatfileNoHeader, warehouse, essbase").create());
+        options.addOption(OptionBuilder.withLongOpt("calculatedData")
+                .hasArg().withDescription("Include calculated data: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("derivedData")
+                .hasArg().withDescription("Include derived data: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("dynamicAccounts")
+                .hasArg().withDescription("Include dynamic accounts: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("dsn")
+                .hasArg().withDescription("Database DSN for warehouse extract").create());
+        options.addOption(OptionBuilder.withLongOpt("prefix")
+                .hasArg().withDescription("Table prefix for warehouse extract").create());
         
-        // Metadata options
-        options.addOption(Option.builder().longOpt("fileFormat").hasArg()
-                .desc("Metadata file format: app, xml").build());
-        options.addOption(Option.builder().longOpt("accounts").hasArg()
-                .desc("Extract accounts: true/false").build());
-        options.addOption(Option.builder().longOpt("entities").hasArg()
-                .desc("Extract entities: true/false").build());
-        options.addOption(Option.builder().longOpt("scenarios").hasArg()
-                .desc("Extract scenarios: true/false").build());
-        options.addOption(Option.builder().longOpt("ICPs").hasArg()
-                .desc("Extract ICPs: true/false").build());
-        options.addOption(Option.builder().longOpt("currencies").hasArg()
-                .desc("Extract currencies: true/false").build());
-        options.addOption(Option.builder().longOpt("values").hasArg()
-                .desc("Extract values: true/false").build());
-        options.addOption(Option.builder().longOpt("applicationSettings").hasArg()
-                .desc("Extract application settings: true/false").build());
-        options.addOption(Option.builder().longOpt("consolidationMethods").hasArg()
-                .desc("Extract consolidation methods: true/false").build());
-        options.addOption(Option.builder().longOpt("cellTextLabels").hasArg()
-                .desc("Extract cell text labels: true/false").build());
-        options.addOption(Option.builder().longOpt("systemAccounts").hasArg()
-                .desc("Extract system accounts: true/false").build());
-        options.addOption(Option.builder().longOpt("customDimensions").hasArg()
-                .desc("Custom dimensions to extract (semicolon-separated)").build());
+        // Metadata extract options
+        options.addOption(OptionBuilder.withLongOpt("fileFormat")
+                .hasArg().withDescription("File format: app, xml, rle").create());
+        options.addOption(OptionBuilder.withLongOpt("accounts")
+                .hasArg().withDescription("Extract accounts: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("entities")
+                .hasArg().withDescription("Extract entities: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("scenarios")
+                .hasArg().withDescription("Extract scenarios: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("currencies")
+                .hasArg().withDescription("Extract currencies: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("values")
+                .hasArg().withDescription("Extract values: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("ICPs")
+                .hasArg().withDescription("Extract ICPs: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("appSettings")
+                .hasArg().withDescription("Extract app settings: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("consolMethods")
+                .hasArg().withDescription("Extract consolidation methods: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("cellTxtLabels")
+                .hasArg().withDescription("Extract cell text labels: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("systemAccounts")
+                .hasArg().withDescription("Extract system accounts: true/false").create());
         
-        // Security options
-        options.addOption(Option.builder().longOpt("securityClasses").hasArg()
-                .desc("Extract security classes: true/false").build());
-        options.addOption(Option.builder().longOpt("roleAccess").hasArg()
-                .desc("Extract role access: true/false").build());
-        options.addOption(Option.builder().longOpt("securityClassAccess").hasArg()
-                .desc("Extract security class access: true/false").build());
-        options.addOption(Option.builder().longOpt("loadUsers").hasArg()
-                .desc("Extract users: true/false").build());
+        // Security extract options
+        options.addOption(OptionBuilder.withLongOpt("users")
+                .hasArg().withDescription("Extract users: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("securityClasses")
+                .hasArg().withDescription("Extract security classes: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("roleAccess")
+                .hasArg().withDescription("Extract role access: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("securityClassAccess")
+                .hasArg().withDescription("Extract security class access: true/false").create());
         
-        // Journal options
-        options.addOption(Option.builder().longOpt("extractJournals").hasArg()
-                .desc("Extract journals: true/false").build());
-        options.addOption(Option.builder().longOpt("extractTemplates").hasArg()
-                .desc("Extract templates: true/false").build());
-        options.addOption(Option.builder().longOpt("posted").hasArg()
-                .desc("Include posted journals: true/false").build());
-        options.addOption(Option.builder().longOpt("approved").hasArg()
-                .desc("Include approved journals: true/false").build());
-        options.addOption(Option.builder().longOpt("submitted").hasArg()
-                .desc("Include submitted journals: true/false").build());
-        options.addOption(Option.builder().longOpt("rejected").hasArg()
-                .desc("Include rejected journals: true/false").build());
-        options.addOption(Option.builder().longOpt("working").hasArg()
-                .desc("Include working journals: true/false").build());
-        options.addOption(Option.builder().longOpt("regular").hasArg()
-                .desc("Include regular journals: true/false").build());
-        options.addOption(Option.builder().longOpt("autoreversing").hasArg()
-                .desc("Include autoreversing journals: true/false").build());
-        options.addOption(Option.builder().longOpt("autoreversal").hasArg()
-                .desc("Include autoreversal journals: true/false").build());
-        options.addOption(Option.builder().longOpt("recurringTemplates").hasArg()
-                .desc("Include recurring templates: true/false").build());
-        options.addOption(Option.builder().longOpt("balanced").hasArg()
-                .desc("Include balanced journals: true/false").build());
-        options.addOption(Option.builder().longOpt("unbalanced").hasArg()
-                .desc("Include unbalanced journals: true/false").build());
-        options.addOption(Option.builder().longOpt("balancedByEntity").hasArg()
-                .desc("Include balanced by entity journals: true/false").build());
-        options.addOption(Option.builder().longOpt("labels").hasArg()
-                .desc("Journal labels filter").build());
-        options.addOption(Option.builder().longOpt("groups").hasArg()
-                .desc("Journal groups filter").build());
+        // Journal extract options
+        options.addOption(OptionBuilder.withLongOpt("regular")
+                .hasArg().withDescription("Include regular journals: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("standard")
+                .hasArg().withDescription("Include standard journals: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("recurring")
+                .hasArg().withDescription("Include recurring journals: true/false").create());
+        options.addOption(OptionBuilder.withLongOpt("labels")
+                .hasArg().withDescription("Journal labels filter (comma-separated)").create());
+        options.addOption(OptionBuilder.withLongOpt("groups")
+                .hasArg().withDescription("Journal groups filter (comma-separated)").create());
+        
+        // Poll interval
+        options.addOption(OptionBuilder.withLongOpt("pollInterval")
+                .hasArg().withDescription("Task polling interval in ms (default: 2000)").create());
         
         return options;
     }
@@ -1103,19 +983,20 @@ public class HfmCli {
     
     private static void printHelp(Options options) {
         System.out.println("HFM Command Line Interface v" + VERSION);
+        System.out.println("Compatible with Oracle EPM/HFM 11.1.2.0");
+        System.out.println();
         System.out.println("Usage: java project1.HfmCli <operation> [options]");
         System.out.println();
         System.out.println("Operations:");
-        System.out.println("  Consolidate            Run consolidation");
-        System.out.println("  LoadData               Load data from file");
-        System.out.println("  Translate              Run translation");
-        System.out.println("  ExtractDataToFlatfile  Extract data to flat file");
-        System.out.println("  ExtractDataToDatabase  Extract data to database");
-        System.out.println("  ExtractMetadata        Extract metadata");
-        System.out.println("  ExtractRules           Extract rules");
-        System.out.println("  ExtractMemberLists     Extract member lists");
-        System.out.println("  ExtractSecurity        Extract security");
-        System.out.println("  ExtractJournals        Extract journals");
+        System.out.println("  Consolidate        Run consolidation on POV");
+        System.out.println("  LoadData           Load data from file");
+        System.out.println("  Translate          Run translation on POV");
+        System.out.println("  ExtractData        Extract data to file/database");
+        System.out.println("  ExtractMetadata    Extract metadata");
+        System.out.println("  ExtractRules       Extract rules");
+        System.out.println("  ExtractMemberLists Extract member lists");
+        System.out.println("  ExtractSecurity    Extract security");
+        System.out.println("  ExtractJournals    Extract journals");
         System.out.println();
         
         HelpFormatter formatter = new HelpFormatter();
@@ -1133,8 +1014,8 @@ public class HfmCli {
         System.out.println("      -f \"C:\\data\\load.dat\" -d \";\" --loadMode Merge");
         System.out.println();
         System.out.println("  Extract Data:");
-        System.out.println("    java project1.HfmCli ExtractDataToFlatfile -u admin -p pass -a HCHFM -c HCHFMP \\");
-        System.out.println("      -s \"S#Actual.Y#2025...\" -f \"C:\\extract\\data.txt\" --extractFormat \"Flatfile - without header\"");
+        System.out.println("    java project1.HfmCli ExtractData -u admin -p pass -a HCHFM -c HCHFMP \\");
+        System.out.println("      -s \"S#Actual.Y#2025...\" --extractFormat flatfile");
         System.out.println();
         System.out.println("Exit Codes:");
         System.out.println("  0 - Success");
@@ -1149,7 +1030,7 @@ public class HfmCli {
     
     public static void main(String[] args) {
         Options options = buildOptions();
-        CommandLineParser parser = new DefaultParser();
+        CommandLineParser parser = new GnuParser();  // Commons CLI 1.2 parser
         
         try {
             // Check for help or version first
@@ -1174,53 +1055,37 @@ public class HfmCli {
             
             // Get common options
             boolean verbose = cl.hasOption("v");
-            int pollInterval = Integer.parseInt(cl.getOptionValue("pollInterval", 
-                    String.valueOf(DEFAULT_POLL_INTERVAL)));
+            int pollInterval = DEFAULT_POLL_INTERVAL;
+            if (cl.hasOption("pollInterval")) {
+                pollInterval = Integer.parseInt(cl.getOptionValue("pollInterval"));
+            }
             
             // Route to appropriate operation handler
             int exitCode;
-            switch (operation.toLowerCase().replace("_", "")) {
-                case "consolidate":
-                    exitCode = doConsolidate(cl, pollInterval, verbose);
-                    break;
-                case "loaddata":
-                case "load":
-                    exitCode = doLoadData(cl, pollInterval, verbose);
-                    break;
-                case "translate":
-                    exitCode = doTranslate(cl, pollInterval, verbose);
-                    break;
-                case "extractdatatoflatfile":
-                case "extractdata":
-                    exitCode = doExtractDataToFlatfile(cl, pollInterval, verbose);
-                    break;
-                case "extractdatatodatabase":
-                case "extractdb":
-                    exitCode = doExtractDataToDatabase(cl, pollInterval, verbose);
-                    break;
-                case "extractmetadata":
-                case "metadata":
-                    exitCode = doExtractMetadata(cl, pollInterval, verbose);
-                    break;
-                case "extractrules":
-                case "rules":
-                    exitCode = doExtractRules(cl, pollInterval, verbose);
-                    break;
-                case "extractmemberlists":
-                case "memberlists":
-                    exitCode = doExtractMemberLists(cl, pollInterval, verbose);
-                    break;
-                case "extractsecurity":
-                case "security":
-                    exitCode = doExtractSecurity(cl, pollInterval, verbose);
-                    break;
-                case "extractjournals":
-                case "journals":
-                    exitCode = doExtractJournals(cl, pollInterval, verbose);
-                    break;
-                default:
-                    jsonError("Unknown operation: " + operation, operation, null);
-                    exitCode = EXIT_INVALID_ARGS;
+            String op = operation.toLowerCase().replace("_", "");
+            
+            if (op.equals("consolidate")) {
+                exitCode = doConsolidate(cl, pollInterval, verbose);
+            } else if (op.equals("loaddata") || op.equals("load")) {
+                exitCode = doLoadData(cl, pollInterval, verbose);
+            } else if (op.equals("translate")) {
+                exitCode = doTranslate(cl, pollInterval, verbose);
+            } else if (op.equals("extractdata") || op.equals("extract")) {
+                exitCode = doExtractData(cl, pollInterval, verbose);
+            } else if (op.equals("extractmetadata") || op.equals("metadata")) {
+                exitCode = doExtractMetadata(cl, pollInterval, verbose);
+            } else if (op.equals("extractrules") || op.equals("rules")) {
+                exitCode = doExtractRules(cl, pollInterval, verbose);
+            } else if (op.equals("extractmemberlists") || op.equals("memberlists")) {
+                exitCode = doExtractMemberLists(cl, pollInterval, verbose);
+            } else if (op.equals("extractsecurity") || op.equals("security")) {
+                exitCode = doExtractSecurity(cl, pollInterval, verbose);
+            } else if (op.equals("extractjournals") || op.equals("journals")) {
+                exitCode = doExtractJournals(cl, pollInterval, verbose);
+            } else {
+                jsonError("Unknown operation: " + operation, operation, null);
+                printHelp(options);
+                exitCode = EXIT_INVALID_ARGS;
             }
             
             System.exit(exitCode);
