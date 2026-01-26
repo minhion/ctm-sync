@@ -574,9 +574,9 @@ public class HfmCli {
             
             // Set file format
             if ("xml".equalsIgnoreCase(fileFormat)) {
-                options.setFileFormat(METADATA_FILE_FORMAT_ENUM.METADATA_FILE_FORMAT_ENUM_XML);
+                options.setFileFormat(METADATA_FILE_FORMAT_ENUM.METADATA_FILE_FORMAT_XML);
             } else {
-                options.setFileFormat(METADATA_FILE_FORMAT_ENUM.METADATA_FILE_FORMAT_ENUM_APP);
+                options.setFileFormat(METADATA_FILE_FORMAT_ENUM.METADATA_FILE_FORMAT_NATIVE);
             }
             
             // Execute extract - returns LoadExtractInfo
