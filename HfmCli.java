@@ -50,7 +50,7 @@ import org.apache.commons.cli.ParseException;
 public class HfmCli {
 
     // ==================== Constants ====================
-    private static final String VERSION = "2.2.0";
+    private static final String VERSION = "2.3.0";
     private static final int DEFAULT_POLL_INTERVAL = 2000; // milliseconds
     
     // Exit codes for Control-M
@@ -431,7 +431,7 @@ public class HfmCli {
 
     // ==================== Operation: Extract Data ====================
     
-    private static int doExtractData(CommandLine cl, int pollInterval, boolean verbose) {
+    private static int doExtractData(CommandLine cl, int pollInterval, boolean verbose, String operationName) {
         long startTime = System.currentTimeMillis();
         String application = cl.getOptionValue("a");
         HfmSession session = null;
@@ -442,7 +442,7 @@ public class HfmCli {
             String cluster = cl.getOptionValue("c");
             String pov = cl.getOptionValue("s");
             String delimiter = cl.getOptionValue("d", ";");
-            String extractFormat = cl.getOptionValue("extractFormat", "flatfile");
+            String extractFormat = cl.getOptionValue("extractFormat");
             boolean calculatedData = Boolean.parseBoolean(cl.getOptionValue("calculatedData", "false"));
             boolean derivedData = Boolean.parseBoolean(cl.getOptionValue("derivedData", "false"));
             boolean dynamicAccounts = Boolean.parseBoolean(cl.getOptionValue("dynamicAccounts", "false"));
@@ -451,11 +451,32 @@ public class HfmCli {
             String dsn = cl.getOptionValue("dsn");
             String prefix = cl.getOptionValue("prefix", "HFM_");
             
+            // Auto-detect format from operation name if not explicitly specified
+            if (extractFormat == null) {
+                if (operationName != null && operationName.contains("database")) {
+                    extractFormat = "warehouse";
+                } else if (dsn != null) {
+                    // If DSN is provided, assume database extract
+                    extractFormat = "warehouse";
+                } else {
+                    extractFormat = "flatfile";
+                }
+            }
+            
             // Validate required parameters
             if (username == null || password == null || application == null || 
                 cluster == null || pov == null) {
                 jsonError("Missing required parameters: -u, -p, -a, -c, -s", "ExtractData", application);
                 return EXIT_INVALID_ARGS;
+            }
+            
+            // For database extract, DSN is required
+            if (extractFormat.toLowerCase().contains("warehouse") || 
+                extractFormat.toLowerCase().contains("database")) {
+                if (dsn == null) {
+                    jsonError("Missing required parameter --dsn for database extract", "ExtractData", application);
+                    return EXIT_INVALID_ARGS;
+                }
             }
             
             // Create session
@@ -985,18 +1006,22 @@ public class HfmCli {
         System.out.println("HFM Command Line Interface v" + VERSION);
         System.out.println("Compatible with Oracle EPM/HFM 11.1.2.0");
         System.out.println();
-        System.out.println("Usage: java project1.HfmCli <operation> [options]");
+        System.out.println("Usage:");
+        System.out.println("  java project1.HfmCli <operation> [options]");
+        System.out.println("  java project1.HfmCli [options] <operation>    (compatible with HFMcons)");
         System.out.println();
         System.out.println("Operations:");
-        System.out.println("  Consolidate        Run consolidation on POV");
-        System.out.println("  LoadData           Load data from file");
-        System.out.println("  Translate          Run translation on POV");
-        System.out.println("  ExtractData        Extract data to file/database");
-        System.out.println("  ExtractMetadata    Extract metadata");
-        System.out.println("  ExtractRules       Extract rules");
-        System.out.println("  ExtractMemberLists Extract member lists");
-        System.out.println("  ExtractSecurity    Extract security");
-        System.out.println("  ExtractJournals    Extract journals");
+        System.out.println("  Consolidate            Run consolidation on POV");
+        System.out.println("  LoadData               Load data from file");
+        System.out.println("  Translate              Run translation on POV");
+        System.out.println("  ExtractData            Extract data to flatfile");
+        System.out.println("  ExtractDataToDatabase  Extract data to database (same as ExtractData --extractFormat warehouse)");
+        System.out.println("  ExtractDataToFlatfile  Extract data to flatfile (same as ExtractData)");
+        System.out.println("  ExtractMetadata        Extract metadata");
+        System.out.println("  ExtractRules           Extract rules");
+        System.out.println("  ExtractMemberLists     Extract member lists");
+        System.out.println("  ExtractSecurity        Extract security");
+        System.out.println("  ExtractJournals        Extract journals");
         System.out.println();
         
         HelpFormatter formatter = new HelpFormatter();
@@ -1028,30 +1053,84 @@ public class HfmCli {
 
     // ==================== Main Entry Point ====================
     
+    /**
+     * Finds the operation from command line arguments.
+     * Operation can be at the START or END of args (for compatibility with existing HFMcons usage).
+     * Returns null if no valid operation found.
+     */
+    private static String findOperation(String[] args) {
+        String[] validOps = {
+            "consolidate", "loaddata", "load", "translate",
+            "extractdata", "extract", "extractdatatodatabase", "extractdatatoflatfile",
+            "extractmetadata", "metadata",
+            "extractrules", "rules",
+            "extractmemberlists", "memberlists",
+            "extractsecurity", "security",
+            "extractjournals", "journals"
+        };
+        
+        // Check each argument for a valid operation
+        for (String arg : args) {
+            if (arg.startsWith("-")) continue; // Skip options
+            String normalized = arg.toLowerCase().replace("_", "");
+            for (String op : validOps) {
+                if (normalized.equals(op)) {
+                    return arg;
+                }
+            }
+        }
+        return null;
+    }
+    
+    /**
+     * Removes the operation from args array for parsing remaining options.
+     */
+    private static String[] removeOperation(String[] args, String operation) {
+        List<String> result = new ArrayList<String>();
+        boolean removed = false;
+        for (String arg : args) {
+            if (!removed && arg.equalsIgnoreCase(operation)) {
+                removed = true;
+                continue;
+            }
+            result.add(arg);
+        }
+        return result.toArray(new String[0]);
+    }
+    
     public static void main(String[] args) {
         Options options = buildOptions();
         CommandLineParser parser = new GnuParser();  // Commons CLI 1.2 parser
         
         try {
             // Check for help or version first
-            if (args.length == 0 || args[0].equals("-h") || args[0].equals("--help")) {
+            if (args.length == 0) {
                 printHelp(options);
                 System.exit(EXIT_SUCCESS);
             }
             
-            if (args[0].equals("-V") || args[0].equals("--version")) {
-                System.out.println("{\"version\":\"" + VERSION + "\"}");
-                System.exit(EXIT_SUCCESS);
+            for (String arg : args) {
+                if (arg.equals("-h") || arg.equals("--help")) {
+                    printHelp(options);
+                    System.exit(EXIT_SUCCESS);
+                }
+                if (arg.equals("-V") || arg.equals("--version")) {
+                    System.out.println("{\"version\":\"" + VERSION + "\"}");
+                    System.exit(EXIT_SUCCESS);
+                }
             }
             
-            // First argument is the operation
-            String operation = args[0];
+            // Find operation (can be at START or END of args for compatibility)
+            String operation = findOperation(args);
+            if (operation == null) {
+                jsonError("No valid operation specified. Use: Consolidate, LoadData, Translate, ExtractData, ExtractDataToDatabase, ExtractMetadata, ExtractRules, ExtractMemberLists, ExtractSecurity, ExtractJournals", "Unknown", null);
+                printHelp(options);
+                System.exit(EXIT_INVALID_ARGS);
+            }
             
-            // Parse remaining arguments
-            String[] remainingArgs = new String[args.length - 1];
-            System.arraycopy(args, 1, remainingArgs, 0, args.length - 1);
-            
-            CommandLine cl = parser.parse(options, remainingArgs);
+            // Remove operation from args and parse remaining options
+            String[] optionArgs = removeOperation(args, operation);
+            CommandLine cl = parser.parse(options, optionArgs);
             
             // Get common options
             boolean verbose = cl.hasOption("v");
@@ -1070,8 +1149,10 @@ public class HfmCli {
                 exitCode = doLoadData(cl, pollInterval, verbose);
             } else if (op.equals("translate")) {
                 exitCode = doTranslate(cl, pollInterval, verbose);
-            } else if (op.equals("extractdata") || op.equals("extract")) {
-                exitCode = doExtractData(cl, pollInterval, verbose);
+            } else if (op.equals("extractdata") || op.equals("extract") || 
+                       op.equals("extractdatatodatabase") || op.equals("extractdatatoflatfile")) {
+                // Pass operation name so we can auto-detect database vs flatfile
+                exitCode = doExtractData(cl, pollInterval, verbose, op);
             } else if (op.equals("extractmetadata") || op.equals("metadata")) {
                 exitCode = doExtractMetadata(cl, pollInterval, verbose);
             } else if (op.equals("extractrules") || op.equals("rules")) {
